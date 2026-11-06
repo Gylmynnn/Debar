@@ -1,4 +1,4 @@
-# cbar
+# debar
 
 Wayland bar ringan berbasis C, `wayland-client`, `wlr-layer-shell`, Cairo, dan Pango.
 Project ini adalah fondasi awal: membuat bar di bagian atas layar dan menggambar teks ke buffer shared-memory.
@@ -45,7 +45,7 @@ meson compile -C build
 Jalankan dari sesi Wayland yang mendukung `wlr-layer-shell`, misalnya Sway atau Hyprland:
 
 ```sh
-./build/cbar
+./build/debar
 ```
 
 Untuk menghentikan proses, tekan `Ctrl+C` dari terminal tempat program dijalankan.
@@ -65,7 +65,7 @@ Ubah nilai tersebut lalu build ulang.
 ## Struktur
 
 ```text
-cbar/
+debar/
 ├── meson.build
 ├── protocols/
 │   └── wlr-layer-shell-unstable-v1.xml

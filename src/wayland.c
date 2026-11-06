@@ -2,11 +2,199 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "ipc.h"
+
 static modules_data_t wayland_data; /* live data, updated every second */
+
+static int g_debug = -1;
+static void dlog(const char *fmt, ...) {
+  va_list ap;
+  if (g_debug < 0) {
+    g_debug = getenv("DEBAR_DEBUG") != NULL;
+  }
+  if (g_debug) {
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+  }
+}
+
+/* ---------------- pointer input ------------------------------------------ */
+
+/* Debounce so one wheel tick does not skip several workspaces. */
+#define SCROLL_MIN_INTERVAL_MS 180
+
+static void pointer_handle_button(wayland_state_t *state) {
+  int index = -1;
+  const bool hit = render_workspace_hit(state->config, state->height,
+                                        &wayland_data, state->pointer_x,
+                                        state->pointer_y, &index);
+  dlog("debar debug: click at (%.1f, %.1f) -> hit=%d index=%d",
+       state->pointer_x, state->pointer_y, hit ? 1 : 0, index);
+  if (!hit) {
+    return;
+  }
+  if (ipc_switch_workspace(&wayland_data, index + 1)) {
+    dlog("debar debug: switched to workspace %d", index + 1);
+    wayland_redraw(state);
+  } else {
+    dlog("debar debug: ipc_switch_workspace FAILED");
+  }
+}
+
+static void pointer_handle_axis(wayland_state_t *state, double value) {
+  static struct timespec last = {0, 0};
+
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  const long now_ms = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+  const long last_ms = last.tv_sec * 1000 + last.tv_nsec / 1000000;
+  if (last_ms != 0 && now_ms - last_ms < SCROLL_MIN_INTERVAL_MS) {
+    return;
+  }
+
+  const int count = wayland_data.ws_count > 0 ? (wayland_data.ws_count > DEBAR_MIN_WORKSPACES ? wayland_data.ws_count : DEBAR_MIN_WORKSPACES) : DEBAR_MIN_WORKSPACES;
+  int target = wayland_data.ws_active + (value > 0.0 ? 1 : -1);
+  if (target < 0) {
+    target = 0;
+  } else if (target >= count) {
+    target = count - 1;
+  }
+  if (target == wayland_data.ws_active) {
+    return;
+  }
+
+  if (ipc_switch_workspace(&wayland_data, target + 1)) {
+    last = now;
+    wayland_redraw(state);
+  }
+}
+
+
+/* ---------------- Seat and pointer listeners ----------------------------- */
+
+static void pointer_enter(void *data, struct wl_pointer *pointer,
+                          uint32_t serial, struct wl_surface *surface,
+                          wl_fixed_t surface_x, wl_fixed_t surface_y) {
+  (void)serial;
+  (void)surface;
+  (void)pointer;
+  wayland_state_t *state = data;
+  state->pointer_x = wl_fixed_to_double(surface_x);
+  state->pointer_y = wl_fixed_to_double(surface_y);
+  dlog("debar debug: pointer enter (%.1f, %.1f)", state->pointer_x,
+       state->pointer_y);
+}
+
+static void pointer_leave(void *data, struct wl_pointer *pointer,
+                          uint32_t serial, struct wl_surface *surface) {
+  (void)data;
+  (void)serial;
+  (void)surface;
+  (void)pointer;
+}
+
+static void pointer_motion(void *data, struct wl_pointer *pointer,
+                           uint32_t time, wl_fixed_t surface_x,
+                           wl_fixed_t surface_y) {
+  (void)time;
+  (void)pointer;
+  wayland_state_t *state = data;
+  state->pointer_x = wl_fixed_to_double(surface_x);
+  state->pointer_y = wl_fixed_to_double(surface_y);
+}
+
+static void pointer_button(void *data, struct wl_pointer *pointer,
+                           uint32_t serial, uint32_t time, uint32_t button,
+                           uint32_t button_state) {
+  (void)pointer;
+  (void)serial;
+  (void)time;
+  (void)button; /* any button switches the workspace under the pointer */
+  if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    pointer_handle_button((wayland_state_t *)data);
+  }
+}
+
+static void pointer_axis(void *data, struct wl_pointer *pointer,
+                         uint32_t time, uint32_t axis,
+                         wl_fixed_t value) {
+  (void)pointer;
+  (void)time;
+  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    pointer_handle_axis((wayland_state_t *)data, wl_fixed_to_double(value));
+  }
+}
+
+static void pointer_frame(void *data, struct wl_pointer *pointer) {
+  (void)data;
+  (void)pointer;
+}
+
+static void pointer_axis_source(void *data, struct wl_pointer *pointer,
+                                uint32_t axis_source) {
+  (void)data;
+  (void)pointer;
+  (void)axis_source;
+}
+
+static void pointer_axis_stop(void *data, struct wl_pointer *pointer,
+                              uint32_t time, uint32_t axis) {
+  (void)data;
+  (void)pointer;
+  (void)time;
+  (void)axis;
+}
+
+static void pointer_axis_discrete(void *data, struct wl_pointer *pointer,
+                                  uint32_t axis, int32_t discrete) {
+  (void)data;
+  (void)pointer;
+  (void)axis;
+  (void)discrete;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_discrete,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *seat,
+                              uint32_t capabilities) {
+  wayland_state_t *state = data;
+  dlog("debar debug: seat capabilities=0x%x", capabilities);
+  if ((capabilities & WL_SEAT_CAPABILITY_POINTER) != 0) {
+    state->pointer = wl_seat_get_pointer(seat);
+    wl_pointer_add_listener(state->pointer, &pointer_listener, state);
+    dlog("debar debug: pointer created");
+  }
+}
+
+static void seat_name(void *data, struct wl_seat *seat, const char *name) {
+  (void)data;
+  (void)seat;
+  (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_capabilities,
+    .name = seat_name,
+};
 
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
@@ -22,6 +210,14 @@ static void registry_global(void *data, struct wl_registry *registry,
   } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
     state->layer_shell =
         wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
+  } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+    const uint32_t bind_version = version < 7 ? version : 7;
+    state->seat = wl_registry_bind(registry, name, &wl_seat_interface,
+                                   bind_version);
+    /* Attach immediately: the capabilities event is emitted by the bind
+     * during the registry roundtrip, and a listener added later would
+     * already have missed it. */
+    wl_seat_add_listener(state->seat, &seat_listener, state);
   }
 }
 
@@ -73,40 +269,40 @@ bool wayland_init(wayland_state_t *state, const bar_config_t *config) {
   state->running = true;
   state->display = wl_display_connect(NULL);
   if (state->display == NULL) {
-    fprintf(stderr, "cbar: cannot connect to Wayland display\n");
+    fprintf(stderr, "debar: cannot connect to Wayland display\n");
     return false;
   }
 
   state->registry = wl_display_get_registry(state->display);
   if (state->registry == NULL) {
-    fprintf(stderr, "cbar: cannot get Wayland registry\n");
+    fprintf(stderr, "debar: cannot get Wayland registry\n");
     return false;
   }
 
   wl_registry_add_listener(state->registry, &registry_listener, state);
   if (wl_display_roundtrip(state->display) < 0) {
-    fprintf(stderr, "cbar: registry roundtrip failed\n");
+    fprintf(stderr, "debar: registry roundtrip failed\n");
     return false;
   }
 
   if (state->compositor == NULL || state->shm == NULL ||
       state->layer_shell == NULL) {
     fprintf(stderr,
-            "cbar: compositor, wl_shm, or wlr-layer-shell is unavailable\n");
+            "debar: compositor, wl_shm, or wlr-layer-shell is unavailable\n");
     return false;
   }
 
   state->surface = wl_compositor_create_surface(state->compositor);
   if (state->surface == NULL) {
-    fprintf(stderr, "cbar: cannot create wl_surface\n");
+    fprintf(stderr, "debar: cannot create wl_surface\n");
     return false;
   }
 
   state->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
       state->layer_shell, state->surface, NULL, ZWLR_LAYER_SHELL_V1_LAYER_TOP,
-      "cbar");
+      "debar");
   if (state->layer_surface == NULL) {
-    fprintf(stderr, "cbar: cannot create layer surface\n");
+    fprintf(stderr, "debar: cannot create layer surface\n");
     return false;
   }
 
@@ -131,6 +327,8 @@ bool wayland_init(wayland_state_t *state, const bar_config_t *config) {
   wl_display_flush(state->display);
 
   modules_init(&wayland_data);
+  ipc_init();
+  ipc_query_workspaces(&wayland_data);
   return true;
 }
 
@@ -144,7 +342,7 @@ void wayland_redraw(wayland_state_t *state) {
   bar_buffer_t *buffer =
       render_buffer_create(state->shm, state->width, state->height);
   if (buffer == NULL) {
-    fprintf(stderr, "cbar: failed to create Wayland buffer\n");
+    fprintf(stderr, "debar: failed to create Wayland buffer\n");
     return;
   }
 
@@ -182,38 +380,74 @@ int wayland_run(wayland_state_t *state) {
     return -1;
   }
 
-  const int fd = wl_display_get_fd(state->display);
-  if (fd < 0) {
-    fprintf(stderr, "cbar: cannot get display fd\n");
+  const int display_fd = wl_display_get_fd(state->display);
+  if (display_fd < 0) {
+    fprintf(stderr, "debar: cannot get display fd\n");
     return -1;
+  }
+
+  const int ipc_fd = ipc_event_fd();
+  struct pollfd fds[2];
+  struct pollfd *display_poll = &fds[0];
+  display_poll->fd = display_fd;
+  display_poll->events = POLLIN;
+  const int nfds = ipc_fd >= 0 ? 2 : 1;
+  if (nfds == 2) {
+    fds[1].fd = ipc_fd;
+    fds[1].events = POLLIN;
   }
 
   while (state->running) {
     wl_display_flush(state->display);
+    display_poll->events = POLLIN;
+    if (nfds == 2) {
+      fds[1].events = POLLIN;
+    }
 
-    struct pollfd fds = {.fd = fd, .events = POLLIN, .revents = 0};
-    const int poll_ret = poll(&fds, 1, 1000);
+    const int poll_ret = poll(fds, (nfds_t)nfds, 1000);
 
     if (poll_ret < 0) {
       if (errno == EINTR) {
         continue;
       }
-      fprintf(stderr, "cbar: poll failed\n");
+      fprintf(stderr, "debar: poll failed\n");
       state->running = false;
       return -1;
     }
 
-    if (poll_ret == 0) {
-      /* one-second tick: refresh live data and repaint */
-      modules_update(&wayland_data);
-      wayland_redraw(state);
-    } else if (fds.revents & POLLIN) {
-      if (wl_display_dispatch(state->display) < 0 && errno != EAGAIN &&
-          errno != EWOULDBLOCK) {
-        fprintf(stderr, "cbar: Wayland event dispatch failed\n");
-        state->running = false;
-        return -1;
+    if (poll_ret > 0) {
+      if (display_poll->revents & POLLIN) {
+        if (wl_display_dispatch(state->display) < 0 && errno != EAGAIN &&
+            errno != EWOULDBLOCK) {
+          fprintf(stderr, "debar: Wayland event dispatch failed\n");
+          state->running = false;
+          return -1;
+        }
       }
+      if (nfds == 2 && (fds[1].revents & POLLIN)) {
+        /* workspace events: update state and repaint immediately */
+        ipc_handle_events(&wayland_data);
+        wayland_redraw(state);
+      }
+      if ((display_poll->revents & POLLERR) != 0 ||
+          (display_poll->revents & POLLHUP) != 0) {
+        state->running = false;
+        break;
+      }
+      if (nfds == 2 && (fds[1].revents & (POLLERR | POLLHUP)) != 0) {
+        state->running = false;
+        break;
+      }
+    }
+
+    if (poll_ret == 0) {
+      /* One-second tick: refresh live data and repaint. Workspaces are
+       * always re-queried so occupancy ("has a program") stays accurate
+       * even when the event stream is connected; the switch grace window
+       * keeps this poll from reverting a just-clicked active workspace. */
+      modules_update(&wayland_data);
+      ipc_query_workspaces(&wayland_data);
+      wayland_redraw(state);
     }
 
     reap_retired_buffers(state);
@@ -225,6 +459,16 @@ int wayland_run(wayland_state_t *state) {
 void wayland_finish(wayland_state_t *state) {
   if (state == NULL) {
     return;
+  }
+
+  ipc_finish();
+  if (state->pointer != NULL) {
+    wl_pointer_destroy(state->pointer);
+    state->pointer = NULL;
+  }
+  if (state->seat != NULL) {
+    wl_seat_destroy(state->seat);
+    state->seat = NULL;
   }
 
   bar_buffer_t *buffer = state->buffers;

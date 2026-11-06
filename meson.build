@@ -1,5 +1,5 @@
 project(
-  'cbar',
+  'debar',
   'c',
   version: '0.1.0',
   meson_version: '>=0.60.0',
@@ -39,7 +39,7 @@ layer_shell_private_code = custom_target(
 )
 
 # wlr-layer-shell's get_popup request references xdg_popup. Generate the
-# xdg-shell interface descriptors too, even though cbar does not create
+# xdg-shell interface descriptors too, even though debar does not create
 # popups yet, so the layer-shell protocol's object type resolves at link time.
 xdg_shell_private_code = custom_target(
   'xdg-shell-private-code',
@@ -51,10 +51,11 @@ xdg_shell_private_code = custom_target(
 inc = include_directories('include', '.')
 
 executable(
-  'cbar',
+  'debar',
   [
     'src/main.c',
     'src/config.c',
+    'src/ipc.c',
     'src/modules.c',
     'src/render.c',
     'src/wayland.c',

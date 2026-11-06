@@ -1,5 +1,5 @@
-#ifndef CBAR_WAYLAND_H
-#define CBAR_WAYLAND_H
+#ifndef DEBAR_WAYLAND_H
+#define DEBAR_WAYLAND_H
 
 #include <stdbool.h>
 #include <wayland-client.h>
@@ -19,6 +19,10 @@ typedef struct wayland_state {
   bar_buffer_t *buffers;
   bar_buffer_t *active_buffer;
   const bar_config_t *config;
+  struct wl_seat *seat;
+  struct wl_pointer *pointer;
+  double pointer_x;
+  double pointer_y;
   bool running;
   bool configured;
   int width;

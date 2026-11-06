@@ -1,5 +1,5 @@
-#ifndef CBAR_CONFIG_H
-#define CBAR_CONFIG_H
+#ifndef DEBAR_CONFIG_H
+#define DEBAR_CONFIG_H
 
 typedef struct bar_config {
   int height;      /* bar height in px (the floating rounded rectangle) */

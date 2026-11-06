@@ -30,7 +30,7 @@ static const char *COL_CREAM = "#ebdbb2"; /* wifi, bluetooth */
 static const char *COL_BLACK = "#000000";
 
 static int create_shared_memory(size_t size) {
-  int fd = memfd_create("cbar-shm", MFD_CLOEXEC);
+  int fd = memfd_create("debar-shm", MFD_CLOEXEC);
   if (fd < 0) {
     perror("memfd_create");
     return -1;
@@ -62,12 +62,12 @@ bar_buffer_t *render_buffer_create(struct wl_shm *shm, int width, int height) {
 
   const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, width);
   if (stride <= 0) {
-    fprintf(stderr, "cbar: invalid buffer stride\n");
+    fprintf(stderr, "debar: invalid buffer stride\n");
     return NULL;
   }
   const size_t size = (size_t)stride * (size_t)height;
   if (size > INT_MAX) {
-    fprintf(stderr, "cbar: requested buffer is too large\n");
+    fprintf(stderr, "debar: requested buffer is too large\n");
     return NULL;
   }
   const int fd = create_shared_memory(size);
@@ -661,6 +661,35 @@ static void draw_bluetooth(cairo_t *cr, double cx, double cy) {
 
 /* ---------------- layout ------------------------------------------------- */
 
+#define WS_STEP 30.0        /* px between workspace icon centers */
+#define WS_PILL_EXTRA 28.0 /* pill padding beyond count * WS_STEP */
+
+bool render_workspace_hit(const bar_config_t *config, int bar_height,
+                          const modules_data_t *data, double px, double py,
+                          int *index_out) {
+  (void)bar_height;
+  (void)py;
+  if (config == NULL || data == NULL || index_out == NULL) {
+    return false;
+  }
+
+  const int count = data->ws_count > 0 ? (data->ws_count > DEBAR_MIN_WORKSPACES ? data->ws_count : DEBAR_MIN_WORKSPACES) : DEBAR_MIN_WORKSPACES;
+  const double x0 = (double)config->padding;
+  if (px < x0 + 2.0 || px > x0 + count * WS_STEP + WS_PILL_EXTRA) {
+    return false;
+  }
+
+  /* ghost centers sit at x + WS_STEP * (i + 1); accept ± WS_STEP / 2 */
+  int index = (int)((px - (x0 + WS_STEP / 2.0)) / WS_STEP);
+  if (index < 0) {
+    index = 0;
+  } else if (index >= count) {
+    index = count - 1;
+  }
+  *index_out = index;
+  return true;
+}
+
 void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
                 const modules_data_t *data) {
   if (buffer == NULL || config == NULL || data == NULL) {
@@ -697,7 +726,7 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
 
   /* workspaces: pac-man = active, filled ghost = occupied, outline = empty */
   {
-    const int count = data->ws_count > 0 ? data->ws_count : 6;
+    const int count = data->ws_count > 0 ? (data->ws_count > DEBAR_MIN_WORKSPACES ? data->ws_count : DEBAR_MIN_WORKSPACES) : DEBAR_MIN_WORKSPACES;
     const double step = 30.0;
     const double w = count * step + 28.0;
 

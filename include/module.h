@@ -1,5 +1,5 @@
-#ifndef CBAR_MODULE_H
-#define CBAR_MODULE_H
+#ifndef DEBAR_MODULE_H
+#define DEBAR_MODULE_H
 
 #include <stdbool.h>
 #include <cairo.h>
