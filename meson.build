@@ -55,6 +55,7 @@ executable(
   [
     'src/main.c',
     'src/config.c',
+    'src/modules.c',
     'src/render.c',
     'src/wayland.c',
     layer_shell_client_header,
