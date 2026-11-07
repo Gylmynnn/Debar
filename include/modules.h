@@ -24,6 +24,13 @@ typedef struct modules_data {
 void modules_init(modules_data_t *data);
 void modules_update(modules_data_t *data);
 
+/* Wheel actions on the volume/brightness pill. delta_percent is the signed
+ * change (e.g. +5 / -10); the external tool runs in the background and the
+ * label is moved optimistically right away, then reconciled by the next
+ * modules_update(). */
+void modules_volume_step(modules_data_t *data, int delta_percent);
+void modules_brightness_step(modules_data_t *data, int delta_percent);
+
 /* The bar at least always shows this many workspace slots; empty ones are
  * drawn as outline ghosts and switchable (the compositor creates them). */
 #define DEBAR_MIN_WORKSPACES 6

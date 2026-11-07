@@ -38,6 +38,21 @@ bool render_workspace_hit(const bar_config_t *config, int bar_height,
 bool render_clock_span(const bar_config_t *config, const modules_data_t *data,
                        double *x_out, double *w_out);
 
+/* Status modules that consume the mouse wheel. The wheel never switches
+ * workspaces - that belongs to the compositor's keybinds. */
+typedef enum render_scroll_target {
+  RENDER_SCROLL_NONE = 0,
+  RENDER_SCROLL_VOLUME,
+  RENDER_SCROLL_BRIGHTNESS,
+} render_scroll_target_t;
+
+/* Which status module (volume/brightness pill) sits under (px, py)? Uses
+ * the same geometry as render_bar, so the wheel only acts on that pill. */
+render_scroll_target_t render_scroll_hit(const bar_config_t *config,
+                                         const modules_data_t *data,
+                                         double bar_width, double px,
+                                         double py);
+
 /* Draws the floating calendar popup (CAL_WIDTH x CAL_HEIGHT buffer). */
 void render_calendar(bar_buffer_t *buffer, const bar_config_t *config,
                      const calendar_t *cal);

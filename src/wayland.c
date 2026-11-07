@@ -267,9 +267,6 @@ static void popup_handle_axis(wayland_state_t *state, double value) {
 
 /* ---------------- pointer input ------------------------------------------ */
 
-/* Debounce so one wheel tick does not skip several workspaces. */
-#define SCROLL_MIN_INTERVAL_MS 180
-
 static void pointer_handle_button(wayland_state_t *state, uint32_t button) {
   /* A click inside the popup only gives it keyboard focus. */
   if (state->popup_surface != NULL &&
@@ -307,32 +304,68 @@ static void pointer_handle_button(wayland_state_t *state, uint32_t button) {
   }
 }
 
+/* Wheel input is accumulated: a mouse wheel sends ~10 axis units per notch,
+ * touchpads send a stream of fractions. Whole notches become 5% steps, so
+ * fast scrolling applies proportionally instead of dropping events. */
+#define WHEEL_UNITS_PER_NOTCH 10.0
+#define WHEEL_STEP_PERCENT 5
+#define WHEEL_MAX_NOTCHES 5
+
+/* The label moves instantly; give the external tool a moment, then reconcile
+ * with the authoritative value from the next poll. */
+#define ACTION_REFRESH_DELAY_MS 120
+static long g_refresh_at_ms = 0;
+static double g_wheel_acc = 0.0;
+
+static long mono_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
 static void pointer_handle_axis(wayland_state_t *state, double value) {
-  static struct timespec last = {0, 0};
-
-  struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  const long now_ms = now.tv_sec * 1000 + now.tv_nsec / 1000000;
-  const long last_ms = last.tv_sec * 1000 + last.tv_nsec / 1000000;
-  if (last_ms != 0 && now_ms - last_ms < SCROLL_MIN_INTERVAL_MS) {
+  /* The wheel never switches workspaces - that belongs to the compositor's
+   * keybinds. It only acts on the volume/brightness pill. */
+  const render_scroll_target_t target = render_scroll_hit(
+      state->config, &wayland_data, (double)state->width, state->pointer_x,
+      state->pointer_y);
+  if (target == RENDER_SCROLL_NONE) {
+    g_wheel_acc = 0.0; /* leaving the pill forgets partial notches */
     return;
   }
 
-  const int count = wayland_data.ws_count > 0 ? (wayland_data.ws_count > DEBAR_MIN_WORKSPACES ? wayland_data.ws_count : DEBAR_MIN_WORKSPACES) : DEBAR_MIN_WORKSPACES;
-  int target = wayland_data.ws_active + (value > 0.0 ? 1 : -1);
-  if (target < 0) {
-    target = 0;
-  } else if (target >= count) {
-    target = count - 1;
+  g_wheel_acc += value;
+  int notches = 0;
+  while (g_wheel_acc >= WHEEL_UNITS_PER_NOTCH) {
+    notches++;
+    g_wheel_acc -= WHEEL_UNITS_PER_NOTCH;
   }
-  if (target == wayland_data.ws_active) {
+  while (g_wheel_acc <= -WHEEL_UNITS_PER_NOTCH) {
+    notches--;
+    g_wheel_acc += WHEEL_UNITS_PER_NOTCH;
+  }
+  if (notches == 0) {
     return;
   }
-
-  if (ipc_switch_workspace(&wayland_data, target + 1)) {
-    last = now;
-    wayland_redraw(state);
+  if (notches > WHEEL_MAX_NOTCHES) {
+    notches = WHEEL_MAX_NOTCHES;
+  } else if (notches < -WHEEL_MAX_NOTCHES) {
+    notches = -WHEEL_MAX_NOTCHES;
   }
+
+  /* wheel down (positive axis) lowers the value */
+  const int delta = -notches * WHEEL_STEP_PERCENT;
+  if (target == RENDER_SCROLL_VOLUME) {
+    modules_volume_step(&wayland_data, delta);
+  } else {
+    modules_brightness_step(&wayland_data, delta);
+  }
+
+  /* the step functions already moved the label: show it right away */
+  wayland_redraw(state);
+  g_refresh_at_ms = mono_ms() + ACTION_REFRESH_DELAY_MS;
+  dlog("debar debug: wheel over %s, %+d%%",
+       target == RENDER_SCROLL_VOLUME ? "volume" : "brightness", delta);
 }
 
 
@@ -762,7 +795,16 @@ int wayland_run(wayland_state_t *state) {
       fds[1].events = POLLIN;
     }
 
-    const int poll_ret = poll(fds, (nfds_t)nfds, 1000);
+    /* Shorten the wait when a wheel action asked for an early refresh. */
+    int timeout = 1000;
+    if (g_refresh_at_ms != 0) {
+      const long remaining = g_refresh_at_ms - mono_ms();
+      timeout = remaining > 0 ? (int)remaining : 0;
+      if (timeout > 1000) {
+        timeout = 1000;
+      }
+    }
+    const int poll_ret = poll(fds, (nfds_t)nfds, timeout);
 
     if (poll_ret < 0) {
       if (errno == EINTR) {
@@ -799,13 +841,15 @@ int wayland_run(wayland_state_t *state) {
     }
 
     if (poll_ret == 0) {
-      /* One-second tick: refresh live data and repaint. Workspaces are
-       * always re-queried so occupancy ("has a program") stays accurate
-       * even when the event stream is connected; the switch grace window
-       * keeps this poll from reverting a just-clicked active workspace. */
+      /* One-second tick (or an early refresh requested by a wheel action):
+       * refresh live data and repaint. Workspaces are always re-queried so
+       * occupancy ("has a program") stays accurate even when the event
+       * stream is connected; the switch grace window keeps this poll from
+       * reverting a just-clicked active workspace. */
       modules_update(&wayland_data);
       ipc_query_workspaces(&wayland_data);
       wayland_redraw(state);
+      g_refresh_at_ms = 0;
       /* midnight rollover: move the "today" marker while the popup is open */
       if (calendar_refresh_today(&state->calendar) &&
           state->popup_surface != NULL) {

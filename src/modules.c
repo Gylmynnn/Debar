@@ -2,11 +2,14 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 static void update_clock(modules_data_t *d) {
   time_t now = time(NULL);
@@ -95,7 +98,30 @@ static void update_mem(modules_data_t *d) {
 static void update_volume(modules_data_t *d) {
   d->volume[0] = '\0';
 
-  FILE *f = popen("pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null", "r");
+  /* PipeWire/WirePlumber first: "Volume: 0.42" (may end with [MUTED]). */
+  FILE *f = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
+  if (f != NULL) {
+    char line[128];
+    if (fgets(line, sizeof(line), f) != NULL) {
+      const char *p = strstr(line, "Volume:");
+      if (p != NULL) {
+        int value = (int)(atof(p + 7) * 100.0 + 0.5);
+        if (value < 0) {
+          value = 0;
+        } else if (value > 100) {
+          value = 100;
+        }
+        snprintf(d->volume, sizeof(d->volume), "%d%%", value);
+      }
+    }
+    pclose(f);
+    if (d->volume[0] != '\0') {
+      return;
+    }
+  }
+
+  /* Fallback: pactl (pipewire-pulse or PulseAudio). */
+  f = popen("pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null", "r");
   if (f == NULL) {
     return;
   }
@@ -240,4 +266,84 @@ void modules_init(modules_data_t *d) {
   d->ws_active = 0;
   d->ws_occupied = 1u << 1;
   modules_update(d);
+}
+
+/* ---- wheel actions: volume / brightness --------------------------------- */
+
+/* Runs a shell command detached from the bar. Double-fork keeps the Wayland
+ * event loop from ever waiting on it and leaves no zombie behind; output is
+ * dropped so a missing tool cannot spam the terminal. */
+static void spawn_async(const char *cmd) {
+  const pid_t pid = fork();
+  if (pid < 0) {
+    return;
+  }
+  if (pid == 0) {
+    const pid_t inner = fork();
+    if (inner == 0) {
+      const int devnull = open("/dev/null", O_WRONLY);
+      if (devnull >= 0) {
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+      }
+      execlp("sh", "sh", "-c", cmd, (char *)NULL);
+      _exit(127);
+    }
+    _exit(inner < 0 ? 1 : 0);
+  }
+  int status = 0;
+  (void)waitpid(pid, &status, 0); /* the intermediate child exits at once */
+}
+
+/* Moves an "NN%" label by delta immediately, so the bar reacts on the very
+ * next frame instead of waiting for the poll. The poll then replaces it with
+ * the authoritative value (correcting any failed command). */
+static void bump_percent(char *label, size_t nlabel, int delta) {
+  if (label[0] == '\0') {
+    return; /* module not shown */
+  }
+  int value = atoi(label) + delta;
+  if (value < 0) {
+    value = 0;
+  } else if (value > 100) {
+    value = 100;
+  }
+  snprintf(label, nlabel, "%d%%", value);
+}
+
+void modules_volume_step(modules_data_t *d, int delta_percent) {
+  if (delta_percent == 0) {
+    return;
+  }
+  const int step = delta_percent < 0 ? -delta_percent : delta_percent;
+  const char sign = delta_percent > 0 ? '+' : '-';
+
+  /* wpctl (PipeWire) with a pactl fallback for pulse-only setups. */
+  char cmd[192];
+  snprintf(cmd, sizeof(cmd),
+           "wpctl set-volume @DEFAULT_AUDIO_SINK@ %d%%%c 2>/dev/null || "
+           "pactl set-sink-volume @DEFAULT_SINK@ %c%d%%",
+           step, sign, sign, step);
+  spawn_async(cmd);
+
+  if (d != NULL) {
+    bump_percent(d->volume, sizeof(d->volume), delta_percent);
+  }
+}
+
+void modules_brightness_step(modules_data_t *d, int delta_percent) {
+  if (delta_percent == 0) {
+    return;
+  }
+  const int step = delta_percent < 0 ? -delta_percent : delta_percent;
+  const char sign = delta_percent > 0 ? '+' : '-';
+
+  char cmd[128];
+  snprintf(cmd, sizeof(cmd), "brightnessctl -q set %d%%%c", step, sign);
+  spawn_async(cmd);
+
+  if (d != NULL) {
+    bump_percent(d->brightness, sizeof(d->brightness), delta_percent);
+  }
 }

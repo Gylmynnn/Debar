@@ -709,6 +709,48 @@ bool render_clock_span(const bar_config_t *config, const modules_data_t *data,
   return true;
 }
 
+render_scroll_target_t render_scroll_hit(const bar_config_t *config,
+                                         const modules_data_t *data,
+                                         double bar_width, double px,
+                                         double py) {
+  if (config == NULL || data == NULL || bar_width <= 0.0) {
+    return RENDER_SCROLL_NONE;
+  }
+
+  const double pill_y = config->padding.top;
+  if (py < pill_y || py > pill_y + config->pill_height) {
+    return RENDER_SCROLL_NONE;
+  }
+
+  const bool has_vol = data->volume[0] != '\0';
+  const bool has_bri = data->brightness[0] != '\0';
+  if (!has_vol && !has_bri) {
+    return RENDER_SCROLL_NONE;
+  }
+
+  PangoFontDescription *font = make_font(config, PANGO_WEIGHT_BOLD);
+  const double vol_text_w = has_vol ? measure_label(font, data->volume) : 0.0;
+  const double bri_text_w =
+      has_bri ? measure_label(font, data->brightness) : 0.0;
+  pango_font_description_free(font);
+
+  /* Same widths as the volume + brightness pill in render_bar. */
+  const double vol_part = has_vol ? 21.25 + 12.0 + vol_text_w : 0.0;
+  const double bri_part = has_bri ? 20.6 + 17.0 + 5.3 + bri_text_w : 0.0;
+  const double w = 15.6 + vol_part + bri_part + 21.5;
+
+  const double rw = bar_width - ((double)config->padding.right - 24.0);
+  const double left = rw - 166.0 - w;
+  if (px < left || px > left + w) {
+    return RENDER_SCROLL_NONE;
+  }
+
+  if (has_vol && px <= left + 15.6 + vol_part) {
+    return RENDER_SCROLL_VOLUME;
+  }
+  return has_bri ? RENDER_SCROLL_BRIGHTNESS : RENDER_SCROLL_NONE;
+}
+
 void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
                 const modules_data_t *data) {
   if (buffer == NULL || config == NULL || data == NULL) {
