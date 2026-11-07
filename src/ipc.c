@@ -18,6 +18,16 @@
 static ipc_compositor_t g_comp = IPC_NONE;
 static int g_event_fd = -1;
 
+/* Routine IPC chatter is hidden unless DEBAR_DEBUG is set; warnings (no
+ * compositor detected, unusable sockets) still go to stderr. */
+static bool ipc_debug(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    enabled = getenv("DEBAR_DEBUG") != NULL;
+  }
+  return enabled != 0;
+}
+
 static char g_sway_sock[PATH_MAX];
 
 /* Hyprland socket1: newline-delimited event stream. */
@@ -565,7 +575,7 @@ static bool hypr_discover(struct ipc_diag *diag) {
   if (g_hypr_cmd_path[0] == '\0') {
     /* list what was there, to help the user report the correct names */
     DIR *dir = opendir(session);
-    if (dir != NULL) {
+    if (dir != NULL && ipc_debug()) {
       struct dirent *entry;
       fprintf(stderr, "debar: hyprland session dir contains:");
       bool first = true;
@@ -655,11 +665,13 @@ ipc_compositor_t ipc_init(void) {
   if (g_comp == IPC_NONE) {
     fprintf(stderr,
             "debar: no compositor IPC detected; workspaces stay decorative\n");
-  } else if (g_comp == IPC_HYPRLAND) {
-    fprintf(stderr, "debar: hyprland IPC cmd=%s events=%s\n", diag.cmd_socket,
-            diag.event_socket);
-  } else {
-    fprintf(stderr, "debar: compositor IPC: sway\n");
+  } else if (ipc_debug()) {
+    if (g_comp == IPC_HYPRLAND) {
+      fprintf(stderr, "debar: hyprland IPC cmd=%s events=%s\n", diag.cmd_socket,
+              diag.event_socket);
+    } else {
+      fprintf(stderr, "debar: compositor IPC: sway\n");
+    }
   }
   return g_comp;
 }
@@ -731,7 +743,7 @@ static int hypr_send_form(const char *path, const char *form, int workspace,
 
   const int fd = connect_unix(path);
   if (fd < 0) {
-    if (verbose) {
+    if (verbose && ipc_debug()) {
       fprintf(stderr, "debar: dispatch: %s connect failed\n", path);
     }
     return HYPR_TRY_DEAD;
@@ -745,13 +757,13 @@ static int hypr_send_form(const char *path, const char *form, int workspace,
   close(fd);
 
   if (!written) {
-    if (verbose) {
+    if (verbose && ipc_debug()) {
       fprintf(stderr, "debar: dispatch via %s -> write failed\n", path);
     }
     return HYPR_TRY_DEAD;
   }
   if (resp[0] == '\0') {
-    if (verbose) {
+    if (verbose && ipc_debug()) {
       fprintf(stderr, "debar: dispatch via %s -> no response\n", path);
     }
     return HYPR_TRY_REJECTED;
@@ -759,14 +771,14 @@ static int hypr_send_form(const char *path, const char *form, int workspace,
   if (strncmp(resp, "error", 5) == 0 ||
       strncmp(resp, "unknown request", 15) == 0 ||
       strncmp(resp, "invalid", 7) == 0) {
-    if (verbose) {
+    if (verbose && ipc_debug()) {
       fprintf(stderr, "debar: dispatch via %s -> rejected (%.80s)\n", path,
               resp);
     }
     return HYPR_TRY_REJECTED;
   }
 
-  if (verbose) {
+  if (verbose && ipc_debug()) {
     fprintf(stderr, "debar: dispatch via %s -> '%s'\n", path, resp);
   }
   return HYPR_TRY_OK;
@@ -790,12 +802,16 @@ static void hypr_probe_syntax(void) {
           snprintf(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), "%s",
                    g_hypr_sockets[i]);
         }
-        fprintf(stderr, "debar: dispatch form %zd: %.40s\n", p, probes[p]);
+        if (ipc_debug()) {
+          fprintf(stderr, "debar: dispatch form %zd: %.40s\n", p, probes[p]);
+        }
         return;
       }
     }
   }
-  fprintf(stderr, "debar: dispatch form unknown yet (probe on first click)\n");
+  if (ipc_debug()) {
+    fprintf(stderr, "debar: dispatch form unknown yet (probe on first click)\n");
+  }
 }
 
 bool ipc_switch_workspace(modules_data_t *d, int workspace) {
@@ -856,8 +872,10 @@ bool ipc_switch_workspace(modules_data_t *d, int workspace) {
       snprintf(cmd, sizeof(cmd), "workspace number %d", workspace);
       sent = sway_send(fd, 0 /* RUN_COMMAND */, cmd);
       close(fd);
-      fprintf(stderr, "debar: sway '%s' -> %s\n", cmd,
-              sent ? "sent" : "write failed");
+      if (ipc_debug()) {
+        fprintf(stderr, "debar: sway '%s' -> %s\n", cmd,
+                sent ? "sent" : "write failed");
+      }
     }
   } else {
     return false;

@@ -20,6 +20,7 @@ typedef struct wayland_state {
   struct zwlr_layer_surface_v1 *layer_surface;
   bar_buffer_t *buffers;
   bar_buffer_t *active_buffer;
+  tray_t *tray;
   const bar_config_t *config;
   struct wl_seat *seat;
   struct wl_pointer *pointer;

@@ -709,10 +709,66 @@ bool render_clock_span(const bar_config_t *config, const modules_data_t *data,
   return true;
 }
 
+/* ---- right-cluster geometry (shared by drawing and hit-testing) --------- */
+
+/* The status icons keep their fixed 28 px pitch; the dynamic tray pill sits
+ * just left of them and pushes the volume/brightness pill (and everything
+ * left of it) outwards. */
+#define TRAY_RIGHT_INSET 166.0
+#define TRAY_SLOT_WIDTH 26.0
+#define TRAY_PILL_PADDING 7.0
+
+static double tray_pill_width(int count) {
+  return count > 0 ? 2.0 * TRAY_PILL_PADDING +
+                         (double)count * TRAY_SLOT_WIDTH
+                   : 0.0;
+}
+
+static double tray_pill_left(const bar_config_t *config, int count,
+                             double bar_width) {
+  const double rw = bar_width - ((double)config->padding.right - 24.0);
+  return rw - TRAY_RIGHT_INSET - tray_pill_width(count);
+}
+
+static double volume_pill_right(const bar_config_t *config, int tray_items,
+                                double bar_width) {
+  const double rw = bar_width - ((double)config->padding.right - 24.0);
+  const double tray_w = tray_pill_width(tray_items);
+  return tray_w > 0.0
+             ? rw - TRAY_RIGHT_INSET - tray_w - (double)config->gap
+             : rw - TRAY_RIGHT_INSET;
+}
+
+static void draw_tray_icon(cairo_t *cr, cairo_surface_t *icon, double cx,
+                           double cy, double size) {
+  if (icon == NULL) {
+    /* unresolved icon: a small dot keeps the slot visible/clickable */
+    set_source_hex(cr, COL_WHITE);
+    cairo_arc(cr, cx, cy, 3.0, 0.0, 2.0 * M_PI);
+    cairo_fill(cr);
+    return;
+  }
+
+  const int w = cairo_image_surface_get_width(icon);
+  const int h = cairo_image_surface_get_height(icon);
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+
+  const double scale = size / (double)(w > h ? w : h);
+  cairo_save(cr);
+  cairo_translate(cr, cx - (double)w * scale / 2.0,
+                  cy - (double)h * scale / 2.0);
+  cairo_scale(cr, scale, scale);
+  cairo_set_source_surface(cr, icon, 0.0, 0.0);
+  cairo_paint(cr);
+  cairo_restore(cr);
+}
+
 render_scroll_target_t render_scroll_hit(const bar_config_t *config,
                                          const modules_data_t *data,
-                                         double bar_width, double px,
-                                         double py) {
+                                         tray_t *tray, double bar_width,
+                                         double px, double py) {
   if (config == NULL || data == NULL || bar_width <= 0.0) {
     return RENDER_SCROLL_NONE;
   }
@@ -739,8 +795,8 @@ render_scroll_target_t render_scroll_hit(const bar_config_t *config,
   const double bri_part = has_bri ? 20.6 + 17.0 + 5.3 + bri_text_w : 0.0;
   const double w = 15.6 + vol_part + bri_part + 21.5;
 
-  const double rw = bar_width - ((double)config->padding.right - 24.0);
-  const double left = rw - 166.0 - w;
+  const double right = volume_pill_right(config, tray_count(tray), bar_width);
+  const double left = right - w;
   if (px < left || px > left + w) {
     return RENDER_SCROLL_NONE;
   }
@@ -751,8 +807,46 @@ render_scroll_target_t render_scroll_hit(const bar_config_t *config,
   return has_bri ? RENDER_SCROLL_BRIGHTNESS : RENDER_SCROLL_NONE;
 }
 
+bool render_tray_hit(const bar_config_t *config, tray_t *tray,
+                     double bar_width, double px, double py, int *index_out) {
+  if (config == NULL || tray == NULL || index_out == NULL ||
+      bar_width <= 0.0) {
+    return false;
+  }
+
+  const int count = tray_count(tray);
+  if (count <= 0) {
+    return false;
+  }
+
+  const double pill_y = config->padding.top;
+  if (py < pill_y || py > pill_y + config->pill_height) {
+    return false;
+  }
+
+  const double left = tray_pill_left(config, count, bar_width);
+  const double width = tray_pill_width(count);
+  if (px < left || px > left + width) {
+    return false;
+  }
+
+  const double rel = px - left - TRAY_PILL_PADDING;
+  if (rel < 0.0 || rel >= (double)count * TRAY_SLOT_WIDTH) {
+    return false;
+  }
+
+  int index = (int)(rel / TRAY_SLOT_WIDTH);
+  if (index < 0) {
+    index = 0;
+  } else if (index >= count) {
+    index = count - 1;
+  }
+  *index_out = index;
+  return true;
+}
+
 void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
-                const modules_data_t *data) {
+                const modules_data_t *data, tray_t *tray) {
   if (buffer == NULL || config == NULL || data == NULL) {
     return;
   }
@@ -780,6 +874,11 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
 
   PangoFontDescription *font_clock = make_font(config, PANGO_WEIGHT_MEDIUM);
   PangoFontDescription *font_bold = make_font(config, PANGO_WEIGHT_BOLD);
+
+  /* Dynamic tray snapshot: holds references until the frame is finished. */
+  cairo_surface_t *tray_icons[DEBAR_TRAY_MAX_ITEMS];
+  const int tray_items =
+      tray_snapshot(tray, tray_icons, DEBAR_TRAY_MAX_ITEMS);
 
   /* ---- left cluster -------------------------------------------------- */
 
@@ -830,6 +929,25 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
   draw_contrast(cr, rw - 78.5, mid_y - 0.5);
   draw_bluetooth(cr, rw - 50.5, mid_y - 0.6);
 
+  /* dynamic system tray: one slot per running StatusNotifierItem */
+  if (tray_items > 0) {
+    const double tray_left = tray_pill_left(config, tray_items, width);
+    const double tray_width = tray_pill_width(tray_items);
+    double icon_size = pill_h * 0.55;
+    if (icon_size < 16.0) {
+      icon_size = 16.0;
+    } else if (icon_size > 24.0) {
+      icon_size = 24.0;
+    }
+
+    draw_pill(cr, tray_left, pill_y, tray_width, pill_h, radius, seg);
+    for (int i = 0; i < tray_items; i++) {
+      const double cx = tray_left + TRAY_PILL_PADDING +
+                        TRAY_SLOT_WIDTH * ((double)i + 0.5);
+      draw_tray_icon(cr, tray_icons[i], cx, mid_y, icon_size);
+    }
+  }
+
   /* volume + brightness pill */
   double vol_left;
   {
@@ -848,7 +966,7 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
     }
     w += 21.5;
 
-    const double right = rw - 166.0;
+    const double right = volume_pill_right(config, tray_items, width);
     vol_left = right - w;
     draw_pill(cr, vol_left, pill_y, w, pill_h, radius, seg);
 
@@ -912,6 +1030,12 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
 
     draw_cube(cr, cx0 + 27.5, mid_y + 0.5, COL_MINT, seg);
     draw_label(cr, font_bold, data->cpu, cx0 + tile + 15.0, mid_y, COL_WHITE);
+  }
+
+  for (int i = 0; i < tray_items; i++) {
+    if (tray_icons[i] != NULL) {
+      cairo_surface_destroy(tray_icons[i]);
+    }
   }
 
   pango_font_description_free(font_clock);

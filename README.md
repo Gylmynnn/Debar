@@ -1,16 +1,25 @@
 # debar
 
-Wayland bar ringan berbasis C, `wayland-client`, `wlr-layer-shell`, Cairo, dan Pango.
-Project ini adalah fondasi awal: membuat bar di bagian atas layar dan menggambar teks ke buffer shared-memory.
+Bar Wayland ringan berbasis C dengan `wayland-client`, `wlr-layer-shell`,
+Cairo/Pango, dan GDBus. Tampilan terdiri dari pill mengambang: workspace,
+jam, system tray dinamis, volume/brightness, CPU, dan RAM.
 
-## Fitur saat ini
+## Fitur
 
-- Membuka koneksi ke Wayland.
-- Membuat `wl_surface` dengan `wlr-layer-shell` pada layer `top`.
-- Menempel di sisi atas layar dan meminta exclusive zone sebesar tinggi bar.
-- Membuat buffer `wl_shm` menggunakan `memfd_create`.
-- Menggambar background dan teks menggunakan Cairo/Pango.
-- Menyimpan konfigurasi dasar di `src/config.c`.
+- Layer surface `top`/`bottom` dengan background transparan dan pill membulat.
+- Indikator workspace bergaya Pac-Man: Pac-Man = workspace aktif, ghost penuh =
+  workspace terpakai, ghost outline = kosong. Minimal 6 slot selalu ditampilkan;
+  slot kosong tetap bisa diklik (compositor yang membuat workspace-nya).
+- Klik slot workspace untuk pindah workspace. Mendukung Hyprland dan Sway
+  melalui IPC masing-masing.
+- Pill jam dengan popup kalender (klik pill jam).
+- **System tray dinamis** (`StatusNotifierItem`): ikon muncul/hilang otomatis
+  saat aplikasi berjalan/berhenti. Klik kiri = `Activate`, klik tengah =
+  `SecondaryActivate`.
+- Pill volume + brightness. Scroll mouse di atas pill ini mengubah nilainya;
+  scroll di bagian lain bar **tidak** mengganti workspace.
+- Pill CPU dan RAM yang dibaca langsung dari `/proc`.
+- Konfigurasi Lua untuk posisi bar, padding, dan margin.
 
 ## Dependensi
 
@@ -19,78 +28,97 @@ Project ini adalah fondasi awal: membuat bar di bagian atas layar dan menggambar
 ```sh
 sudo apt install build-essential meson ninja-build pkg-config \
   libwayland-dev libwayland-bin wayland-protocols libcairo2-dev libpango1.0-dev \
-  liblua5.4-dev
+  liblua5.4-dev libglib2.0-dev libgdk-pixbuf-2.0-dev
 ```
 
 ### Arch Linux
 
 ```sh
 sudo pacman -S --needed base-devel meson ninja pkgconf \
-  wayland wayland-protocols cairo pango lua
+  wayland wayland-protocols cairo pango lua glib2 gdk-pixbuf2
 ```
 
-`wayland-scanner` harus tersedia di `PATH` (di Debian/Ubuntu disediakan oleh paket `libwayland-bin`).
+`wayland-scanner` harus tersedia di `PATH` (di Debian/Ubuntu disediakan oleh
+paket `libwayland-bin`).
+
+- `gio-2.0` (GLib) wajib untuk system tray.
+- `gdk-pixbuf-2.0` opsional. Tanpa paket ini tray hanya bisa memuat ikon PNG;
+  dengan paket ini (dan loader SVG/librsvg) ikon SVG dari icon theme juga bisa
+  dimuat.
+- Untuk fitur volume/brightness, sediakan `wpctl` (WirePlumber) atau `pactl`
+  (PulseAudio / PipeWire-pulse), serta `brightnessctl`.
+- System tray membutuhkan `org.kde.StatusNotifierWatcher` di session bus
+  (Waybar, KDE, atau implementasi lain yang menyediakannya).
 
 ## Build
-
-File `wlr-layer-shell-unstable-v1.xml` mempertahankan urutan request v1 dan tipe argumen `xdg_popup` sesuai protokol upstream. Jangan menghapus request yang belum dipakai, seperti `set_margin` atau `get_popup`: opcode Wayland ditentukan berdasarkan urutan, sehingga menghapus satu request akan menggeser opcode berikutnya dan menyebabkan protocol error saat runtime. Karena `get_popup` merujuk interface `xdg_popup`, build juga mengambil `xdg-shell.xml` dari paket `wayland-protocols` dan mengompilasi deskriptor interfacenya.
-
 
 ```sh
 meson setup build
 meson compile -C build
 ```
 
+File `protocols/wlr-layer-shell-unstable-v1.xml` mempertahankan urutan request
+v1 dan tipe argumen `xdg_popup` sesuai protokol upstream. Jangan menghapus
+request yang belum dipakai, seperti `set_margin` atau `get_popup`: opcode
+Wayland ditentukan berdasarkan urutan, sehingga menghapus satu request akan
+menggeser opcode berikutnya dan menyebabkan protocol error saat runtime.
+Karena `get_popup` merujuk interface `xdg_popup`, build juga mengambil
+`xdg-shell.xml` dari paket `wayland-protocols` dan mengompilasi deskriptor
+interfacenya.
+
 ## Jalankan
 
-Jalankan dari sesi Wayland yang mendukung `wlr-layer-shell`, misalnya Sway atau Hyprland:
+Jalankan dari sesi Wayland yang mendukung `wlr-layer-shell`, misalnya Sway atau
+Hyprland:
 
 ```sh
 ./build/debar
 ```
 
-Untuk menghentikan proses, tekan `Ctrl+C` dari terminal tempat program dijalankan.
+Hentikan dengan `Ctrl+C` dari terminal tempat program dijalankan, atau
+`pkill -x debar`.
 
-## Konfigurasi awal
+### Debug
 
-Default berada di `src/config.c`:
-
-- Tinggi: `32` px
-- Padding teks: `12` px
-- Font: `Inter 10`
-- Background: `#1e1e2e`
-- Foreground: `#cdd6f4`
-
-Ubah nilai tersebut lalu build ulang.
-
-## Struktur
-
-```text
-debar/
-├── meson.build
-├── protocols/
-│   └── wlr-layer-shell-unstable-v1.xml
-├── include/
-│   ├── calendar.h
-│   ├── config.h
-│   ├── module.h
-│   ├── render.h
-│   └── wayland.h
-└── src/
-    ├── main.c
-    ├── calendar.c
-    ├── config.c
-    ├── render.c
-    ├── wayland.c
-    └── modules/
-        └── README.md
+```sh
+DEBAR_DEBUG=1 ./build/debar
 ```
 
-File XML di `protocols/` berisi subset client-side versi 1 yang dibutuhkan oleh starter ini. Header dan source protokol digenerate otomatis oleh `wayland-scanner` ketika build. Paket `wayland-protocols` menyediakan definisi resmi `xdg-shell` yang diperlukan untuk tipe objek popup.
+Log detail tray, IPC, dan input ditulis ke stderr. Tanpa variabel ini debar
+tetap tenang; hanya peringatan penting (misalnya compositor IPC tidak
+terdeteksi) yang tetap dicetak.
+
+`DEBAR_ICON_THEME` dapat dipakai untuk memaksa icon theme yang dipakai tray:
+
+```sh
+DEBAR_ICON_THEME=Gruvbox-Plus-Dark ./build/debar
+```
+
+Tanpa variabel tersebut, debar membaca `gtk-icon-theme-name` dari
+`~/.config/gtk-3.0/settings.ini` atau `gtk-4.0/settings.ini`, lalu jatuh ke
+`hicolor`. Rantai pewarisan theme (`Inherits`) ikut diikuti.
+
+## Input
+
+| Area | Aksi |
+| --- | --- |
+| Slot workspace | Klik kiri: pindah ke workspace tersebut |
+| Pill jam | Klik kiri: buka/tutup kalender |
+| Ikon tray | Klik kiri: `Activate`; klik tengah: `SecondaryActivate` |
+| Pill volume/brightness | Scroll: ubah nilai (5% per notch) |
+| Area lain | Scroll diabaikan |
+
+Scroll diakumulasi: mouse wheel mengirim sekitar 10 unit per notch dan touchpad
+mengirim pecahan, sehingga scroll cepat tetap terasa proporsional. Perubahan
+label ditampilkan langsung (optimistis), lalu diselaraskan dengan pembacaan
+`wpctl`/`pactl`/`brightnessctl` berikutnya. Scroll tidak pernah mengganti
+workspace; perpindahan workspace sepenuhnya milik keybind compositor.
 
 ## Konfigurasi (Lua)
 
-debar membaca `~/.config/debar/config.lua` (atau `$XDG_CONFIG_HOME/debar/config.lua`) saat start. Kalau file tidak ada, nilai default dipakai. Contoh lengkap ada di `examples/config.lua`:
+debar membaca `~/.config/debar/config.lua` (atau
+`$XDG_CONFIG_HOME/debar/config.lua`) saat start. Kalau file tidak ada, nilai
+default dipakai. Contoh ada di `examples/config.lua`:
 
 ```sh
 mkdir -p ~/.config/debar
@@ -105,15 +133,27 @@ File ini Lua biasa dan harus diakhiri `return { ... }`. Semua opsi opsional.
 | `padding` | angka (semua sisi) atau tabel `{ top, bottom, left, right }` dalam px | `{ top = 9, bottom = 9, left = 24, right = 24 }` |
 | `margin` | sama seperti `padding` | `{ top = 6, bottom = 6, left = 5, right = 5 }` |
 
-- `padding` adalah jarak antara tepi bar dan pill di dalamnya. Tinggi bar mengikuti: `35 (tinggi pill) + top + bottom`, jadi default menghasilkan 53 px seperti sebelumnya.
-- `margin` adalah jarak antara bar dan tepi layar. Pada bar `top`, `margin.top` adalah jarak dari tepi atas layar dan `margin.bottom` adalah ruang kosong antara bar dan jendela; pada bar `bottom` sebaliknya. `margin.left` dan `margin.right` mengatur jarak ke tepi kiri/kanan, sehingga bar menyempit sesuai nilainya.
-- Opsi yang salah ketik, nilai di luar rentang, atau error sintaks Lua tidak menghentikan bar: pesan ditulis ke stderr dan opsi terkait memakai default.
-- `position = "left"` / `"right"` belum didukung (bar vertikal butuh layout sendiri); sementara dipakai `"top"` dengan peringatan.
-- Kalender popup muncul di bawah bar jika `position = "top"`, dan di atas bar jika `"bottom"`.
+- `padding` adalah jarak antara tepi bar dan pill di dalamnya. Tinggi bar
+  mengikuti `pill_height + padding.top + padding.bottom`; default menghasilkan
+  53 px.
+- `margin` adalah jarak antara bar dan tepi layar. Pada bar `top`,
+  `margin.top` adalah jarak dari tepi atas layar dan `margin.bottom` adalah
+  ruang kosong antara bar dan jendela; pada bar `bottom` sebaliknya.
+  `margin.left` dan `margin.right` mengatur jarak ke tepi kiri/kanan, sehingga
+  bar menyempit sesuai nilainya.
+- Opsi yang salah ketik, nilai di luar rentang, atau error sintaks Lua tidak
+  menghentikan bar: pesan ditulis ke stderr dan opsi terkait memakai default.
+- `position = "left"` / `"right"` belum didukung; sementara dipakai `"top"`
+  dengan peringatan.
+- Nilai visual lain (radius, tinggi pill, gap, font, warna) masih berada di
+  `src/config.c`. Ubah di sana lalu build ulang.
 
 ## Kalender popup
 
-Klik kiri pada pill jam untuk membuka kalender mengambang tepat di bawah bar (rata kiri dengan pill jam). Klik lagi pill jam, klik bagian lain bar, tekan `Esc`/`q`, atau pindah fokus ke jendela lain untuk menutupnya.
+Klik kiri pada pill jam untuk membuka kalender mengambang tepat di bawah bar
+(rata kiri dengan pill jam) jika `position = "top"`, dan di atas bar jika
+`"bottom"`. Klik lagi pill jam, klik bagian lain bar, tekan `Esc`/`q`, atau
+pindah fokus ke jendela lain untuk menutupnya.
 
 | Input | Aksi |
 | --- | --- |
@@ -124,22 +164,68 @@ Klik kiri pada pill jam untuk membuka kalender mengambang tepat di bawah bar (ra
 
 Catatan:
 
-- Popup adalah layer surface kedua (layer `overlay`) dengan `keyboard_interactivity = on_demand`, jadi klik popup sekali agar menerima input keyboard. `on_demand` butuh `wlr-layer-shell` v4, karena itu `protocols/wlr-layer-shell-unstable-v1.xml` dinaikkan ke versi 4 (urutan opcode tidak berubah).
-- Tombol keyboard dibaca langsung sebagai kode evdev, sehingga tidak perlu `xkbcommon`.
-- Logika tanggal ada di `src/calendar.c` (minggu mulai Senin, selalu 6 baris), penggambaran di `render_calendar()` pada `src/render.c`.
+- Popup adalah layer surface kedua (layer `overlay`) dengan
+  `keyboard_interactivity = on_demand`, jadi klik popup sekali agar menerima
+  input keyboard. `on_demand` butuh `wlr-layer-shell` v4.
+- Tombol keyboard dibaca langsung sebagai kode evdev, sehingga tidak perlu
+  `xkbcommon`.
+- Logika tanggal ada di `src/calendar.c` (minggu mulai Senin, selalu 6 baris),
+  penggambaran di `render_calendar()` pada `src/render.c`.
 
-## Tahap berikutnya
+## System tray
 
-1. Tambahkan sistem modul (`module.h` dan direktori `src/modules/`).
-2. Implementasikan clock dengan `timerfd` agar update tidak memakai busy-loop.
-3. Tambahkan pembacaan battery dari `/sys/class/power_supply/`.
-4. Tambahkan volume melalui PipeWire atau PulseAudio.
-5. Tambahkan workspace melalui protokol compositor yang sesuai.
-6. Tambahkan config parser dan layout kiri/tengah/kanan.
-7. Tambahkan output/monitor selection, tray, serta input click.
+Tray memakai D-Bus `StatusNotifierWatcher`/`StatusNotifierItem` di thread
+terpisah dengan `GMainContext` sendiri. Bar tidak pernah memblokir D-Bus:
+snapshot ikon dilindungi mutex, dan sebuah self-pipe membangunkan poll loop
+Wayland saat isi tray berubah. Aktifasi ikon dijalankan di thread singkat agar
+klik tetap responsif.
+
+- Maksimal 12 ikon (`DEBAR_TRAY_MAX_ITEMS`).
+- Sumber ikon dipilih berurutan: `IconPixmap` (ARGB32), lalu `IconName` dari
+  `IconThemePath` item, lalu icon theme aktif beserta rantai `Inherits`, lalu
+  `/usr/share/pixmaps`.
+- Item yang tidak punya ikon yang bisa dibaca tetap mendapat slot kosong.
+- Jika session bus atau watcher tidak tersedia, tray hanya kosong; bar tetap
+  berjalan normal.
+
+## Struktur
+
+```text
+debar/
+├── meson.build
+├── protocols/
+│   └── wlr-layer-shell-unstable-v1.xml
+├── examples/
+│   └── config.lua
+├── include/
+│   ├── calendar.h
+│   ├── config.h
+│   ├── ipc.h
+│   ├── module.h
+│   ├── modules.h
+│   ├── render.h
+│   ├── tray.h
+│   └── wayland.h
+└── src/
+    ├── main.c
+    ├── calendar.c
+    ├── config.c
+    ├── ipc.c
+    ├── modules.c
+    ├── render.c
+    ├── tray.c
+    └── wayland.c
+```
+
+Header dan source protokol digenerate otomatis oleh `wayland-scanner` ketika
+build. Paket `wayland-protocols` menyediakan definisi resmi `xdg-shell` yang
+diperlukan untuk tipe objek popup.
 
 ## Catatan
 
-- MVP ini menargetkan compositor Wayland yang menyediakan `zwlr_layer_shell_v1`.
-- `xkbcommon`, D-Bus, PipeWire, PulseAudio, UPower, dan JSON belum dibutuhkan pada tahap awal.
-- Project ini belum mengimplementasikan tray, multi-monitor selection, click action, atau status modules.
+- Target utama adalah compositor Wayland yang menyediakan
+  `zwlr_layer_shell_v1` (Hyprland, Sway, dan compositor wlroots lain).
+- Workspace dan perpindahan workspace membutuhkan Hyprland atau Sway. Di
+  compositor lain bar tetap tampil, tetapi indikator workspace tidak terisi.
+- Proyek belum mendukung multi-monitor selection atau penempatan bar per
+  output; bar tampil di output yang dipilih compositor secara default.

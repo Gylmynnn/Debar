@@ -4,6 +4,7 @@
 #include "calendar.h"
 #include "config.h"
 #include "modules.h"
+#include "tray.h"
 #include <cairo.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -23,7 +24,7 @@ typedef struct bar_buffer {
 
 bar_buffer_t *render_buffer_create(struct wl_shm *shm, int width, int height);
 void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
-                const modules_data_t *data);
+                const modules_data_t *data, tray_t *tray);
 void render_buffer_destroy(bar_buffer_t *buffer);
 
 /* Hit-testing: which workspace ghost sits under (px, py)? Uses the same
@@ -50,8 +51,12 @@ typedef enum render_scroll_target {
  * the same geometry as render_bar, so the wheel only acts on that pill. */
 render_scroll_target_t render_scroll_hit(const bar_config_t *config,
                                          const modules_data_t *data,
-                                         double bar_width, double px,
-                                         double py);
+                                         tray_t *tray, double bar_width,
+                                         double px, double py);
+
+/* Which tray icon sits under (px, py)? Returns false outside the tray pill. */
+bool render_tray_hit(const bar_config_t *config, tray_t *tray,
+                     double bar_width, double px, double py, int *index_out);
 
 /* Draws the floating calendar popup (CAL_WIDTH x CAL_HEIGHT buffer). */
 void render_calendar(bar_buffer_t *buffer, const bar_config_t *config,

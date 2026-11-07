@@ -13,8 +13,19 @@ wayland_client = dependency('wayland-client')
 wayland_protocols = dependency('wayland-protocols')
 cairo = dependency('cairo')
 pangocairo = dependency('pangocairo')
+# D-Bus for the StatusNotifierItem system tray.
+gio = dependency('gio-2.0')
+# Optional: loads PNG/SVG icons from icon themes (SVG needs librsvg's loader).
+gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: false)
 # Lua runs ~/.config/debar/config.lua. Any of 5.1-5.4 / LuaJIT works.
 lua = dependency(['lua5.4', 'lua-5.4', 'lua54', 'lua5.3', 'lua', 'luajit'])
+
+tray_deps = [gio]
+tray_c_args = []
+if gdk_pixbuf.found()
+  tray_deps += gdk_pixbuf
+  tray_c_args += '-DDEBAR_HAVE_GDK_PIXBUF'
+endif
 
 wayland_scanner = find_program('wayland-scanner')
 layer_shell_xml = files('protocols/wlr-layer-shell-unstable-v1.xml')
@@ -61,12 +72,14 @@ executable(
     'src/ipc.c',
     'src/modules.c',
     'src/render.c',
+    'src/tray.c',
     'src/wayland.c',
     layer_shell_client_header,
     layer_shell_private_code,
     xdg_shell_private_code,
   ],
   include_directories: inc,
-  dependencies: [wayland_client, cairo, pangocairo, lua],
+  c_args: tray_c_args,
+  dependencies: [wayland_client, cairo, pangocairo, lua] + tray_deps,
   install: true,
 )

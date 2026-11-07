@@ -41,6 +41,7 @@ static void dlog(const char *fmt, ...) {
 #define EVDEV_KEY_RIGHT 106
 #define EVDEV_KEY_DOWN 108
 #define EVDEV_BTN_LEFT 0x110
+#define EVDEV_BTN_MIDDLE 0x112
 
 /* gap between the bar and the calendar popup, in px */
 #define CAL_BAR_GAP 6
@@ -287,6 +288,19 @@ static void pointer_handle_button(wayland_state_t *state, uint32_t button) {
   /* Any other click on the bar dismisses an open calendar. */
   popup_close(state);
 
+  /* Tray icons: left activates the item, middle asks for its secondary
+   * action (usually "open menu"). */
+  if (button == EVDEV_BTN_LEFT || button == EVDEV_BTN_MIDDLE) {
+    int tray_index = -1;
+    if (render_tray_hit(state->config, state->tray, (double)state->width,
+                        state->pointer_x, state->pointer_y, &tray_index)) {
+      tray_activate(state->tray, tray_index, button == EVDEV_BTN_MIDDLE);
+      dlog("debar debug: tray click index=%d secondary=%d", tray_index,
+           button == EVDEV_BTN_MIDDLE ? 1 : 0);
+      return;
+    }
+  }
+
   int index = -1;
   const bool hit = render_workspace_hit(state->config, state->height,
                                         &wayland_data, state->pointer_x,
@@ -327,8 +341,8 @@ static void pointer_handle_axis(wayland_state_t *state, double value) {
   /* The wheel never switches workspaces - that belongs to the compositor's
    * keybinds. It only acts on the volume/brightness pill. */
   const render_scroll_target_t target = render_scroll_hit(
-      state->config, &wayland_data, (double)state->width, state->pointer_x,
-      state->pointer_y);
+      state->config, &wayland_data, state->tray, (double)state->width,
+      state->pointer_x, state->pointer_y);
   if (target == RENDER_SCROLL_NONE) {
     g_wheel_acc = 0.0; /* leaving the pill forgets partial notches */
     return;
@@ -728,6 +742,7 @@ bool wayland_init(wayland_state_t *state, const bar_config_t *config) {
   modules_init(&wayland_data);
   ipc_init();
   ipc_query_workspaces(&wayland_data);
+  state->tray = tray_create();
   return true;
 }
 
@@ -745,7 +760,7 @@ void wayland_redraw(wayland_state_t *state) {
     return;
   }
 
-  render_bar(buffer, state->config, &wayland_data);
+  render_bar(buffer, state->config, &wayland_data, state->tray);
 
   if (state->active_buffer != NULL) {
     state->active_buffer->retired = true;
@@ -778,21 +793,40 @@ int wayland_run(wayland_state_t *state) {
   }
 
   const int ipc_fd = ipc_event_fd();
-  struct pollfd fds[2];
-  struct pollfd *display_poll = &fds[0];
-  display_poll->fd = display_fd;
-  display_poll->events = POLLIN;
-  const int nfds = ipc_fd >= 0 ? 2 : 1;
-  if (nfds == 2) {
-    fds[1].fd = ipc_fd;
-    fds[1].events = POLLIN;
+  const int tray_fd =
+      state->tray != NULL ? tray_event_fd(state->tray) : -1;
+
+  struct pollfd fds[3];
+  int nfds = 0;
+  const int display_index = nfds++;
+  fds[display_index].fd = display_fd;
+  fds[display_index].events = POLLIN;
+  fds[display_index].revents = 0;
+
+  int ipc_index = -1;
+  if (ipc_fd >= 0) {
+    ipc_index = nfds++;
+    fds[ipc_index].fd = ipc_fd;
+    fds[ipc_index].events = POLLIN;
+    fds[ipc_index].revents = 0;
+  }
+
+  int tray_index = -1;
+  if (tray_fd >= 0) {
+    tray_index = nfds++;
+    fds[tray_index].fd = tray_fd;
+    fds[tray_index].events = POLLIN;
+    fds[tray_index].revents = 0;
   }
 
   while (state->running) {
     wl_display_flush(state->display);
-    display_poll->events = POLLIN;
-    if (nfds == 2) {
-      fds[1].events = POLLIN;
+    fds[display_index].events = POLLIN;
+    if (ipc_index >= 0) {
+      fds[ipc_index].events = POLLIN;
+    }
+    if (tray_index >= 0) {
+      fds[tray_index].events = POLLIN;
     }
 
     /* Shorten the wait when a wheel action asked for an early refresh. */
@@ -816,7 +850,7 @@ int wayland_run(wayland_state_t *state) {
     }
 
     if (poll_ret > 0) {
-      if (display_poll->revents & POLLIN) {
+      if ((fds[display_index].revents & POLLIN) != 0) {
         if (wl_display_dispatch(state->display) < 0 && errno != EAGAIN &&
             errno != EWOULDBLOCK) {
           fprintf(stderr, "debar: Wayland event dispatch failed\n");
@@ -824,17 +858,22 @@ int wayland_run(wayland_state_t *state) {
           return -1;
         }
       }
-      if (nfds == 2 && (fds[1].revents & POLLIN)) {
+      if (ipc_index >= 0 && (fds[ipc_index].revents & POLLIN) != 0) {
         /* workspace events: update state and repaint immediately */
         ipc_handle_events(&wayland_data);
         wayland_redraw(state);
       }
-      if ((display_poll->revents & POLLERR) != 0 ||
-          (display_poll->revents & POLLHUP) != 0) {
+      if (tray_index >= 0 && (fds[tray_index].revents & POLLIN) != 0) {
+        /* tray items appeared/disappeared or changed their icon */
+        tray_drain_events(state->tray);
+        wayland_redraw(state);
+      }
+      if ((fds[display_index].revents & (POLLERR | POLLHUP)) != 0) {
         state->running = false;
         break;
       }
-      if (nfds == 2 && (fds[1].revents & (POLLERR | POLLHUP)) != 0) {
+      if (ipc_index >= 0 &&
+          (fds[ipc_index].revents & (POLLERR | POLLHUP)) != 0) {
         state->running = false;
         break;
       }
@@ -868,6 +907,8 @@ void wayland_finish(wayland_state_t *state) {
     return;
   }
 
+  tray_destroy(state->tray);
+  state->tray = NULL;
   ipc_finish();
   popup_close(state);
   if (state->keyboard != NULL) {
