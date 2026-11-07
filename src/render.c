@@ -690,6 +690,25 @@ bool render_workspace_hit(const bar_config_t *config, int bar_height,
   return true;
 }
 
+bool render_clock_span(const bar_config_t *config, const modules_data_t *data,
+                       double *x_out, double *w_out) {
+  if (config == NULL || data == NULL || x_out == NULL || w_out == NULL) {
+    return false;
+  }
+
+  /* Same math as render_bar: workspace pill, gap, then the clock pill. */
+  const int count = data->ws_count > 0 ? (data->ws_count > DEBAR_MIN_WORKSPACES ? data->ws_count : DEBAR_MIN_WORKSPACES) : DEBAR_MIN_WORKSPACES;
+  const double ws_w = count * 30.0 + 28.0;
+
+  PangoFontDescription *font = make_font(config, PANGO_WEIGHT_MEDIUM);
+  const double text_w = measure_label(font, data->clock);
+  pango_font_description_free(font);
+
+  *x_out = (double)config->padding + ws_w + (double)config->gap;
+  *w_out = 49.5 + text_w + 26.5;
+  return true;
+}
+
 void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
                 const modules_data_t *data) {
   if (buffer == NULL || config == NULL || data == NULL) {
@@ -851,6 +870,151 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
 
   pango_font_description_free(font_clock);
   pango_font_description_free(font_bold);
+  cairo_destroy(cr);
+  cairo_surface_flush(buffer->surface);
+}
+
+/* ---------------- calendar popup ----------------------------------------- */
+
+/* Everblush palette. Panel, text and separator follow the bar config
+ * (#141b1e / #dadada / #232a2d); the rest are fixed Everblush tones. */
+static const char *CAL_ACCENT = "#8ccf7e"; /* everblush green: header, today */
+static const char *CAL_DIM = "#4f5456";    /* foreground #dadada at 30% */
+static const char *CAL_HINT = "#636769";   /* foreground #dadada at 40% */
+
+static PangoFontDescription *make_font_px(const bar_config_t *config,
+                                          PangoWeight weight, double px) {
+  PangoFontDescription *font = pango_font_description_new();
+  pango_font_description_set_family(font, config->font_family);
+  pango_font_description_set_weight(font, weight);
+  pango_font_description_set_absolute_size(font, px * PANGO_SCALE);
+  return font;
+}
+
+/* Draws text so that the *cap height* is centered on cap_cy (digits and
+ * capitals look vertically centered, unlike centering the line box).
+ * x is the left edge, or the center when centered is true.
+ * Returns the rendered width. */
+static double draw_text_cap(cairo_t *cr, PangoFontDescription *font, double px,
+                            const char *text, double x, double cap_cy,
+                            const char *color, bool centered) {
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  pango_layout_set_font_description(layout, font);
+  pango_layout_set_text(layout, text, -1);
+
+  int w = 0;
+  int h = 0;
+  pango_layout_get_pixel_size(layout, &w, &h);
+  const double baseline = pango_layout_get_baseline(layout) / (double)PANGO_SCALE;
+
+  set_source_hex(cr, color);
+  cairo_move_to(cr, centered ? x - w / 2.0 : x, cap_cy + px * 0.365 - baseline);
+  pango_cairo_show_layout(cr, layout);
+
+  g_object_unref(layout);
+  return (double)w;
+}
+
+void render_calendar(bar_buffer_t *buffer, const bar_config_t *config,
+                     const calendar_t *cal) {
+  if (buffer == NULL || config == NULL || cal == NULL) {
+    return;
+  }
+
+  cairo_t *cr = cairo_create(buffer->surface);
+  const double width = buffer->width;
+  const double height = buffer->height;
+  const double mid_x = width / 2.0;
+
+  cairo_set_antialias(cr, CAIRO_ANTIALIAS_GOOD);
+  cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+  cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
+  cairo_paint(cr);
+  cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+  const char *CAL_BG = config->background;
+  const char *CAL_TEXT = config->foreground;
+  const char *CAL_RULE = config->segment;
+
+  draw_pill(cr, 0.0, 0.0, width, height, 16.0, CAL_BG);
+
+  PangoFontDescription *font_title = make_font_px(config, PANGO_WEIGHT_BOLD, 15.0);
+  PangoFontDescription *font_head = make_font_px(config, PANGO_WEIGHT_BOLD, 13.0);
+  PangoFontDescription *font_day = make_font_px(config, PANGO_WEIGHT_NORMAL, 13.0);
+  PangoFontDescription *font_hint = make_font_px(config, PANGO_WEIGHT_NORMAL, 10.0);
+
+  /* title: "November 2026" */
+  char title[48];
+  snprintf(title, sizeof(title), "%s %d", calendar_month_name(cal->month),
+           cal->year);
+  draw_text_cap(cr, font_title, 15.0, title, mid_x, 24.5, CAL_TEXT, true);
+
+  /* grid geometry: 7 columns x 6 rows, centered in the panel */
+  const double col0 = mid_x - 3.0 * 34.0;
+  const double col_pitch = 34.0;
+  const double head_y = 58.5;
+  const double row0 = 84.0;
+  const double row_pitch = 28.0;
+
+  static const char *const WEEKDAYS[7] = {"Mo", "Tu", "We", "Th",
+                                          "Fr", "Sa", "Su"};
+  for (int c = 0; c < 7; c++) {
+    draw_text_cap(cr, font_head, 13.0, WEEKDAYS[c], col0 + c * col_pitch,
+                  head_y, CAL_ACCENT, true);
+  }
+
+  calendar_cell_t cells[42];
+  calendar_build_grid(cal, cells);
+  for (int i = 0; i < 42; i++) {
+    const double cx = col0 + (i % 7) * col_pitch;
+    const double cy = row0 + (i / 7) * row_pitch;
+    char text[8];
+    snprintf(text, sizeof(text), "%d", cells[i].day);
+
+    if (cells[i].today) {
+      /* 31 x 26 marker, same size as in the reference */
+      rounded_rect(cr, cx - 15.0, cy - 13.0, 31.0, 26.0, 6.0);
+      if (cal->style == 0) {
+        set_source_hex(cr, CAL_ACCENT);
+        cairo_fill(cr);
+        draw_text_cap(cr, font_head, 13.0, text, cx, cy + 0.5, CAL_BG, true);
+      } else {
+        set_source_hex(cr, CAL_ACCENT);
+        cairo_set_line_width(cr, 1.5);
+        cairo_stroke(cr);
+        draw_text_cap(cr, font_head, 13.0, text, cx, cy + 0.5, CAL_ACCENT, true);
+      }
+    } else {
+      draw_text_cap(cr, font_day, 13.0, text, cx, cy + 0.5,
+                    cells[i].month_offset == 0 ? CAL_TEXT : CAL_DIM, true);
+    }
+  }
+
+  /* footer: separator + key hints, centered as one group */
+  set_source_hex(cr, CAL_RULE);
+  cairo_rectangle(cr, 50.0, 249.0, 199.0, 1.0);
+  cairo_fill(cr);
+
+  static const char *const HINTS[4] = {"\xe2\x86\x90\xe2\x86\x92 mo",
+                                       "\xe2\x86\x91\xe2\x86\x93 yr",
+                                       "\xe2\x86\xb5 today", "s style"};
+  const double hint_gap = 19.0;
+  double widths[4];
+  double total = hint_gap * 3.0;
+  for (int i = 0; i < 4; i++) {
+    widths[i] = measure_label(font_hint, HINTS[i]);
+    total += widths[i];
+  }
+  double hx = mid_x - total / 2.0;
+  for (int i = 0; i < 4; i++) {
+    draw_text_cap(cr, font_hint, 10.0, HINTS[i], hx, 265.5, CAL_HINT, false);
+    hx += widths[i] + hint_gap;
+  }
+
+  pango_font_description_free(font_title);
+  pango_font_description_free(font_head);
+  pango_font_description_free(font_day);
+  pango_font_description_free(font_hint);
   cairo_destroy(cr);
   cairo_surface_flush(buffer->surface);
 }

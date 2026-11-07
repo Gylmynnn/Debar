@@ -54,6 +54,7 @@ executable(
   'debar',
   [
     'src/main.c',
+    'src/calendar.c',
     'src/config.c',
     'src/ipc.c',
     'src/modules.c',

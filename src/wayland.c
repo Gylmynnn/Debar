@@ -27,12 +27,260 @@ static void dlog(const char *fmt, ...) {
   }
 }
 
+/* ---------------- calendar popup ----------------------------------------- */
+
+/* evdev key codes (wl_keyboard.key reports raw evdev codes), so no xkbcommon
+ * dependency is needed for these few fixed keys. */
+#define EVDEV_KEY_ESC 1
+#define EVDEV_KEY_Q 16
+#define EVDEV_KEY_ENTER 28
+#define EVDEV_KEY_S 31
+#define EVDEV_KEY_KPENTER 96
+#define EVDEV_KEY_UP 103
+#define EVDEV_KEY_LEFT 105
+#define EVDEV_KEY_RIGHT 106
+#define EVDEV_KEY_DOWN 108
+#define EVDEV_BTN_LEFT 0x110
+
+static void reap_list(bar_buffer_t **head) {
+  bar_buffer_t **link = head;
+  while (*link != NULL) {
+    bar_buffer_t *buffer = *link;
+    if (buffer->retired && !buffer->busy) {
+      *link = buffer->next;
+      render_buffer_destroy(buffer);
+    } else {
+      link = &buffer->next;
+    }
+  }
+}
+
+static void popup_redraw(wayland_state_t *state) {
+  if (state->popup_surface == NULL || !state->popup_configured) {
+    return;
+  }
+
+  bar_buffer_t *buffer =
+      render_buffer_create(state->shm, CAL_WIDTH, CAL_HEIGHT);
+  if (buffer == NULL) {
+    fprintf(stderr, "debar: failed to create calendar buffer\n");
+    return;
+  }
+
+  render_calendar(buffer, state->config, &state->calendar);
+
+  if (state->popup_active != NULL) {
+    state->popup_active->retired = true;
+  }
+  buffer->busy = true;
+  buffer->next = state->popup_buffers;
+  state->popup_buffers = buffer;
+  state->popup_active = buffer;
+
+  wl_surface_attach(state->popup_surface, buffer->wl_buffer, 0, 0);
+  wl_surface_damage(state->popup_surface, 0, 0, CAL_WIDTH, CAL_HEIGHT);
+  wl_surface_commit(state->popup_surface);
+  wl_display_flush(state->display);
+}
+
+static void popup_close(wayland_state_t *state) {
+  if (state->popup_surface == NULL) {
+    return;
+  }
+
+  if (state->pointer_surface == state->popup_surface) {
+    state->pointer_surface = NULL;
+  }
+  if (state->keyboard_surface == state->popup_surface) {
+    state->keyboard_surface = NULL;
+  }
+
+  if (state->popup_layer != NULL) {
+    zwlr_layer_surface_v1_destroy(state->popup_layer);
+    state->popup_layer = NULL;
+  }
+  wl_surface_destroy(state->popup_surface);
+  state->popup_surface = NULL;
+  state->popup_configured = false;
+
+  bar_buffer_t *buffer = state->popup_buffers;
+  while (buffer != NULL) {
+    bar_buffer_t *next = buffer->next;
+    render_buffer_destroy(buffer);
+    buffer = next;
+  }
+  state->popup_buffers = NULL;
+  state->popup_active = NULL;
+
+  wl_display_flush(state->display);
+}
+
+static void popup_layer_configure(void *data,
+                                  struct zwlr_layer_surface_v1 *layer_surface,
+                                  uint32_t serial, uint32_t width,
+                                  uint32_t height) {
+  (void)width;
+  (void)height;
+  wayland_state_t *state = data;
+  zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
+  state->popup_configured = true;
+  popup_redraw(state);
+}
+
+static void popup_layer_closed(void *data,
+                               struct zwlr_layer_surface_v1 *layer_surface) {
+  (void)layer_surface;
+  popup_close((wayland_state_t *)data);
+}
+
+static const struct zwlr_layer_surface_v1_listener popup_layer_listener = {
+    .configure = popup_layer_configure,
+    .closed = popup_layer_closed,
+};
+
+/* Opens the calendar just below the bar, left-aligned with the clock pill. */
+static void popup_open(wayland_state_t *state) {
+  if (state->popup_surface != NULL || !state->configured) {
+    return;
+  }
+
+  const bar_config_t *config = state->config;
+  calendar_goto_today(&state->calendar);
+
+  double clock_x = 0.0;
+  double clock_w = 0.0;
+  render_clock_span(config, &wayland_data, &clock_x, &clock_w);
+
+  const int screen_w = state->width + 2 * config->margin_side;
+  int left = config->margin_side + (int)clock_x;
+  if (left + CAL_WIDTH > screen_w - config->margin_side) {
+    left = screen_w - config->margin_side - CAL_WIDTH;
+  }
+  if (left < config->margin_side) {
+    left = config->margin_side;
+  }
+  /* bar margin + bar height + the same gap again below the bar */
+  const int top = config->margin_top + state->height + config->margin_top;
+
+  state->popup_surface = wl_compositor_create_surface(state->compositor);
+  if (state->popup_surface == NULL) {
+    fprintf(stderr, "debar: cannot create calendar surface\n");
+    return;
+  }
+
+  state->popup_layer = zwlr_layer_shell_v1_get_layer_surface(
+      state->layer_shell, state->popup_surface, NULL,
+      ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "debar-calendar");
+  if (state->popup_layer == NULL) {
+    fprintf(stderr, "debar: cannot create calendar layer surface\n");
+    wl_surface_destroy(state->popup_surface);
+    state->popup_surface = NULL;
+    return;
+  }
+
+  zwlr_layer_surface_v1_set_size(state->popup_layer, CAL_WIDTH, CAL_HEIGHT);
+  zwlr_layer_surface_v1_set_anchor(state->popup_layer,
+                                   ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+  zwlr_layer_surface_v1_set_margin(state->popup_layer, top, 0, 0, left);
+  /* -1: position from the screen edge, ignore the bar's exclusive zone */
+  zwlr_layer_surface_v1_set_exclusive_zone(state->popup_layer, -1);
+  /* on_demand (layer-shell v4): keyboard focus after the first click on the
+   * popup, and released again when the user clicks elsewhere. */
+  zwlr_layer_surface_v1_set_keyboard_interactivity(
+      state->popup_layer,
+      state->layer_shell_version >= 4
+          ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND
+          : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+  zwlr_layer_surface_v1_add_listener(state->popup_layer, &popup_layer_listener,
+                                     state);
+
+  /* The first commit must not contain a buffer. */
+  wl_surface_commit(state->popup_surface);
+  wl_display_flush(state->display);
+}
+
+static void popup_toggle(wayland_state_t *state) {
+  if (state->popup_surface != NULL) {
+    popup_close(state);
+  } else {
+    popup_open(state);
+  }
+}
+
+static void popup_handle_key(wayland_state_t *state, uint32_t key) {
+  switch (key) {
+  case EVDEV_KEY_ESC:
+  case EVDEV_KEY_Q:
+    popup_close(state);
+    return;
+  case EVDEV_KEY_LEFT:
+    calendar_shift_month(&state->calendar, -1);
+    break;
+  case EVDEV_KEY_RIGHT:
+    calendar_shift_month(&state->calendar, 1);
+    break;
+  case EVDEV_KEY_UP:
+    calendar_shift_year(&state->calendar, -1);
+    break;
+  case EVDEV_KEY_DOWN:
+    calendar_shift_year(&state->calendar, 1);
+    break;
+  case EVDEV_KEY_ENTER:
+  case EVDEV_KEY_KPENTER:
+    calendar_goto_today(&state->calendar);
+    break;
+  case EVDEV_KEY_S:
+    calendar_toggle_style(&state->calendar);
+    break;
+  default:
+    return;
+  }
+  popup_redraw(state);
+}
+
+/* Mouse wheel over the popup flips months. */
+static void popup_handle_axis(wayland_state_t *state, double value) {
+  static struct timespec last = {0, 0};
+
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  const long now_ms = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+  const long last_ms = last.tv_sec * 1000 + last.tv_nsec / 1000000;
+  if (last_ms != 0 && now_ms - last_ms < 120) {
+    return;
+  }
+  last = now;
+
+  calendar_shift_month(&state->calendar, value > 0.0 ? 1 : -1);
+  popup_redraw(state);
+}
+
 /* ---------------- pointer input ------------------------------------------ */
 
 /* Debounce so one wheel tick does not skip several workspaces. */
 #define SCROLL_MIN_INTERVAL_MS 180
 
-static void pointer_handle_button(wayland_state_t *state) {
+static void pointer_handle_button(wayland_state_t *state, uint32_t button) {
+  /* A click inside the popup only gives it keyboard focus. */
+  if (state->popup_surface != NULL &&
+      state->pointer_surface == state->popup_surface) {
+    return;
+  }
+
+  /* Left click on the clock pill toggles the calendar. */
+  double clock_x = 0.0;
+  double clock_w = 0.0;
+  if (button == EVDEV_BTN_LEFT &&
+      render_clock_span(state->config, &wayland_data, &clock_x, &clock_w) &&
+      state->pointer_x >= clock_x && state->pointer_x <= clock_x + clock_w) {
+    popup_toggle(state);
+    return;
+  }
+
+  /* Any other click on the bar dismisses an open calendar. */
+  popup_close(state);
+
   int index = -1;
   const bool hit = render_workspace_hit(state->config, state->height,
                                         &wayland_data, state->pointer_x,
@@ -85,9 +333,9 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
                           uint32_t serial, struct wl_surface *surface,
                           wl_fixed_t surface_x, wl_fixed_t surface_y) {
   (void)serial;
-  (void)surface;
   (void)pointer;
   wayland_state_t *state = data;
+  state->pointer_surface = surface;
   state->pointer_x = wl_fixed_to_double(surface_x);
   state->pointer_y = wl_fixed_to_double(surface_y);
   dlog("debar debug: pointer enter (%.1f, %.1f)", state->pointer_x,
@@ -96,10 +344,12 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
 
 static void pointer_leave(void *data, struct wl_pointer *pointer,
                           uint32_t serial, struct wl_surface *surface) {
-  (void)data;
   (void)serial;
-  (void)surface;
   (void)pointer;
+  wayland_state_t *state = data;
+  if (state->pointer_surface == surface) {
+    state->pointer_surface = NULL;
+  }
 }
 
 static void pointer_motion(void *data, struct wl_pointer *pointer,
@@ -118,9 +368,10 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
   (void)pointer;
   (void)serial;
   (void)time;
-  (void)button; /* any button switches the workspace under the pointer */
+  /* any button switches the workspace under the pointer; the calendar
+   * itself only reacts to the left button */
   if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
-    pointer_handle_button((wayland_state_t *)data);
+    pointer_handle_button((wayland_state_t *)data, button);
   }
 }
 
@@ -129,8 +380,15 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
                          wl_fixed_t value) {
   (void)pointer;
   (void)time;
-  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-    pointer_handle_axis((wayland_state_t *)data, wl_fixed_to_double(value));
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
+  wayland_state_t *state = data;
+  if (state->popup_surface != NULL &&
+      state->pointer_surface == state->popup_surface) {
+    popup_handle_axis(state, wl_fixed_to_double(value));
+  } else {
+    pointer_handle_axis(state, wl_fixed_to_double(value));
   }
 }
 
@@ -174,6 +432,85 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis_discrete = pointer_axis_discrete,
 };
 
+/* ---------------- keyboard (calendar shortcuts) -------------------------- */
+
+static void keyboard_keymap(void *data, struct wl_keyboard *keyboard,
+                            uint32_t format, int32_t fd, uint32_t size) {
+  (void)data;
+  (void)keyboard;
+  (void)format;
+  (void)size;
+  close(fd); /* raw evdev codes are enough, the keymap is not parsed */
+}
+
+static void keyboard_enter(void *data, struct wl_keyboard *keyboard,
+                           uint32_t serial, struct wl_surface *surface,
+                           struct wl_array *keys) {
+  (void)keyboard;
+  (void)serial;
+  (void)keys;
+  wayland_state_t *state = data;
+  state->keyboard_surface = surface;
+}
+
+static void keyboard_leave(void *data, struct wl_keyboard *keyboard,
+                           uint32_t serial, struct wl_surface *surface) {
+  (void)keyboard;
+  (void)serial;
+  wayland_state_t *state = data;
+  if (state->keyboard_surface == surface) {
+    state->keyboard_surface = NULL;
+  }
+  /* focus moved to another window: dismiss the calendar */
+  if (state->popup_surface != NULL && surface == state->popup_surface) {
+    popup_close(state);
+  }
+}
+
+static void keyboard_key(void *data, struct wl_keyboard *keyboard,
+                         uint32_t serial, uint32_t time, uint32_t key,
+                         uint32_t key_state) {
+  (void)keyboard;
+  (void)serial;
+  (void)time;
+  wayland_state_t *state = data;
+  if (key_state == WL_KEYBOARD_KEY_STATE_PRESSED &&
+      state->popup_surface != NULL &&
+      state->keyboard_surface == state->popup_surface) {
+    popup_handle_key(state, key);
+  }
+}
+
+static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
+                               uint32_t serial, uint32_t mods_depressed,
+                               uint32_t mods_latched, uint32_t mods_locked,
+                               uint32_t group) {
+  (void)data;
+  (void)keyboard;
+  (void)serial;
+  (void)mods_depressed;
+  (void)mods_latched;
+  (void)mods_locked;
+  (void)group;
+}
+
+static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
+                                 int32_t rate, int32_t delay) {
+  (void)data;
+  (void)keyboard;
+  (void)rate;
+  (void)delay;
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap = keyboard_keymap,
+    .enter = keyboard_enter,
+    .leave = keyboard_leave,
+    .key = keyboard_key,
+    .modifiers = keyboard_modifiers,
+    .repeat_info = keyboard_repeat_info,
+};
+
 static void seat_capabilities(void *data, struct wl_seat *seat,
                               uint32_t capabilities) {
   wayland_state_t *state = data;
@@ -182,6 +519,12 @@ static void seat_capabilities(void *data, struct wl_seat *seat,
     state->pointer = wl_seat_get_pointer(seat);
     wl_pointer_add_listener(state->pointer, &pointer_listener, state);
     dlog("debar debug: pointer created");
+  }
+  if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0 &&
+      state->keyboard == NULL) {
+    state->keyboard = wl_seat_get_keyboard(seat);
+    wl_keyboard_add_listener(state->keyboard, &keyboard_listener, state);
+    dlog("debar debug: keyboard created");
   }
 }
 
@@ -208,8 +551,11 @@ static void registry_global(void *data, struct wl_registry *registry,
   } else if (strcmp(interface, wl_shm_interface.name) == 0) {
     state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
   } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
-    state->layer_shell =
-        wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
+    /* v4 adds keyboard_interactivity=on_demand, used by the calendar. */
+    const uint32_t bind_version = version < 4 ? version : 4;
+    state->layer_shell = wl_registry_bind(
+        registry, name, &zwlr_layer_shell_v1_interface, bind_version);
+    state->layer_shell_version = bind_version;
   } else if (strcmp(interface, wl_seat_interface.name) == 0) {
     const uint32_t bind_version = version < 7 ? version : 7;
     state->seat = wl_registry_bind(registry, name, &wl_seat_interface,
@@ -267,6 +613,7 @@ bool wayland_init(wayland_state_t *state, const bar_config_t *config) {
   memset(state, 0, sizeof(*state));
   state->config = config;
   state->running = true;
+  calendar_init(&state->calendar);
   state->display = wl_display_connect(NULL);
   if (state->display == NULL) {
     fprintf(stderr, "debar: cannot connect to Wayland display\n");
@@ -363,16 +710,8 @@ void wayland_redraw(wayland_state_t *state) {
 }
 
 static void reap_retired_buffers(wayland_state_t *state) {
-  bar_buffer_t **link = &state->buffers;
-  while (*link != NULL) {
-    bar_buffer_t *buffer = *link;
-    if (buffer->retired && !buffer->busy) {
-      *link = buffer->next;
-      render_buffer_destroy(buffer);
-    } else {
-      link = &buffer->next;
-    }
-  }
+  reap_list(&state->buffers);
+  reap_list(&state->popup_buffers);
 }
 
 int wayland_run(wayland_state_t *state) {
@@ -448,6 +787,11 @@ int wayland_run(wayland_state_t *state) {
       modules_update(&wayland_data);
       ipc_query_workspaces(&wayland_data);
       wayland_redraw(state);
+      /* midnight rollover: move the "today" marker while the popup is open */
+      if (calendar_refresh_today(&state->calendar) &&
+          state->popup_surface != NULL) {
+        popup_redraw(state);
+      }
     }
 
     reap_retired_buffers(state);
@@ -462,6 +806,11 @@ void wayland_finish(wayland_state_t *state) {
   }
 
   ipc_finish();
+  popup_close(state);
+  if (state->keyboard != NULL) {
+    wl_keyboard_destroy(state->keyboard);
+    state->keyboard = NULL;
+  }
   if (state->pointer != NULL) {
     wl_pointer_destroy(state->pointer);
     state->pointer = NULL;

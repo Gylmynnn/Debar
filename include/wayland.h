@@ -2,8 +2,10 @@
 #define DEBAR_WAYLAND_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <wayland-client.h>
 
+#include "calendar.h"
 #include "config.h"
 #include "render.h"
 #include "wlr-layer-shell-client-protocol.h"
@@ -21,8 +23,21 @@ typedef struct wayland_state {
   const bar_config_t *config;
   struct wl_seat *seat;
   struct wl_pointer *pointer;
+  struct wl_keyboard *keyboard;
+  struct wl_surface *pointer_surface;  /* surface under the pointer */
+  struct wl_surface *keyboard_surface; /* surface with keyboard focus */
+  uint32_t layer_shell_version;
   double pointer_x;
   double pointer_y;
+
+  /* floating calendar popup (created on demand, see popup_open) */
+  struct wl_surface *popup_surface;
+  struct zwlr_layer_surface_v1 *popup_layer;
+  bar_buffer_t *popup_buffers;
+  bar_buffer_t *popup_active;
+  bool popup_configured;
+  calendar_t calendar;
+
   bool running;
   bool configured;
   int width;

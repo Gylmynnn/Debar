@@ -1,6 +1,7 @@
 #ifndef DEBAR_RENDER_H
 #define DEBAR_RENDER_H
 
+#include "calendar.h"
 #include "config.h"
 #include "modules.h"
 #include <cairo.h>
@@ -31,5 +32,14 @@ void render_buffer_destroy(bar_buffer_t *buffer);
 bool render_workspace_hit(const bar_config_t *config, int bar_height,
                           const modules_data_t *data, double px, double py,
                           int *index_out);
+
+/* Horizontal span of the clock pill inside the bar surface (same geometry as
+ * render_bar). Used for click hit-testing and popup placement. */
+bool render_clock_span(const bar_config_t *config, const modules_data_t *data,
+                       double *x_out, double *w_out);
+
+/* Draws the floating calendar popup (CAL_WIDTH x CAL_HEIGHT buffer). */
+void render_calendar(bar_buffer_t *buffer, const bar_config_t *config,
+                     const calendar_t *cal);
 
 #endif

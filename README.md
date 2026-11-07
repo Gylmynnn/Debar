@@ -70,12 +70,14 @@ debar/
 ├── protocols/
 │   └── wlr-layer-shell-unstable-v1.xml
 ├── include/
+│   ├── calendar.h
 │   ├── config.h
 │   ├── module.h
 │   ├── render.h
 │   └── wayland.h
 └── src/
     ├── main.c
+    ├── calendar.c
     ├── config.c
     ├── render.c
     ├── wayland.c
@@ -84,6 +86,23 @@ debar/
 ```
 
 File XML di `protocols/` berisi subset client-side versi 1 yang dibutuhkan oleh starter ini. Header dan source protokol digenerate otomatis oleh `wayland-scanner` ketika build. Paket `wayland-protocols` menyediakan definisi resmi `xdg-shell` yang diperlukan untuk tipe objek popup.
+
+## Kalender popup
+
+Klik kiri pada pill jam untuk membuka kalender mengambang tepat di bawah bar (rata kiri dengan pill jam). Klik lagi pill jam, klik bagian lain bar, tekan `Esc`/`q`, atau pindah fokus ke jendela lain untuk menutupnya.
+
+| Input | Aksi |
+| --- | --- |
+| `←` / `→` atau scroll mouse di atas popup | bulan sebelumnya / berikutnya |
+| `↑` / `↓` | tahun sebelumnya / berikutnya |
+| `Enter` | kembali ke hari ini |
+| `s` | ganti gaya penanda hari ini (terisi / outline) |
+
+Catatan:
+
+- Popup adalah layer surface kedua (layer `overlay`) dengan `keyboard_interactivity = on_demand`, jadi klik popup sekali agar menerima input keyboard. `on_demand` butuh `wlr-layer-shell` v4, karena itu `protocols/wlr-layer-shell-unstable-v1.xml` dinaikkan ke versi 4 (urutan opcode tidak berubah).
+- Tombol keyboard dibaca langsung sebagai kode evdev, sehingga tidak perlu `xkbcommon`.
+- Logika tanggal ada di `src/calendar.c` (minggu mulai Senin, selalu 6 baris), penggambaran di `render_calendar()` pada `src/render.c`.
 
 ## Tahap berikutnya
 
