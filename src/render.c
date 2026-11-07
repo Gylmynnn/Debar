@@ -674,7 +674,7 @@ bool render_workspace_hit(const bar_config_t *config, int bar_height,
   }
 
   const int count = data->ws_count > 0 ? (data->ws_count > DEBAR_MIN_WORKSPACES ? data->ws_count : DEBAR_MIN_WORKSPACES) : DEBAR_MIN_WORKSPACES;
-  const double x0 = (double)config->padding;
+  const double x0 = (double)config->padding.left;
   if (px < x0 + 2.0 || px > x0 + count * WS_STEP + WS_PILL_EXTRA) {
     return false;
   }
@@ -704,7 +704,7 @@ bool render_clock_span(const bar_config_t *config, const modules_data_t *data,
   const double text_w = measure_label(font, data->clock);
   pango_font_description_free(font);
 
-  *x_out = (double)config->padding + ws_w + (double)config->gap;
+  *x_out = (double)config->padding.left + ws_w + (double)config->gap;
   *w_out = 49.5 + text_w + 26.5;
   return true;
 }
@@ -730,8 +730,8 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
   draw_pill(cr, 0.0, 0.0, width, height, config->radius, config->background);
 
   const double pill_h = config->pill_height;
-  const double pill_y = (height - pill_h) / 2.0;
-  const double mid_y = height / 2.0;
+  const double pill_y = config->padding.top;
+  const double mid_y = pill_y + pill_h / 2.0;
   const double radius = pill_h / 2.0;
   const double gap = config->gap;
   const char *seg = config->segment;
@@ -741,7 +741,7 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
 
   /* ---- left cluster -------------------------------------------------- */
 
-  double x = config->padding;
+  double x = config->padding.left;
 
   /* workspaces: pac-man = active, filled ghost = occupied, outline = empty */
   {
@@ -778,11 +778,15 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
 
   /* ---- right cluster (laid out from the right edge) ------------------- */
 
+  /* The offsets below were measured with a 24 px right padding; shift them
+   * when the configured padding differs. */
+  const double rw = width - ((double)config->padding.right - 24.0);
+
   /* status icons: usb, wifi, contrast, bluetooth (28 px pitch) */
-  draw_usb(cr, width - 134.5, mid_y - 0.6);
-  draw_wifi(cr, width - 106.5, mid_y - 0.6);
-  draw_contrast(cr, width - 78.5, mid_y - 0.5);
-  draw_bluetooth(cr, width - 50.5, mid_y - 0.6);
+  draw_usb(cr, rw - 134.5, mid_y - 0.6);
+  draw_wifi(cr, rw - 106.5, mid_y - 0.6);
+  draw_contrast(cr, rw - 78.5, mid_y - 0.5);
+  draw_bluetooth(cr, rw - 50.5, mid_y - 0.6);
 
   /* volume + brightness pill */
   double vol_left;
@@ -802,7 +806,7 @@ void render_bar(bar_buffer_t *buffer, const bar_config_t *config,
     }
     w += 21.5;
 
-    const double right = width - 166.0;
+    const double right = rw - 166.0;
     vol_left = right - w;
     draw_pill(cr, vol_left, pill_y, w, pill_h, radius, seg);
 

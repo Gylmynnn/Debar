@@ -18,14 +18,15 @@ Project ini adalah fondasi awal: membuat bar di bagian atas layar dan menggambar
 
 ```sh
 sudo apt install build-essential meson ninja-build pkg-config \
-  libwayland-dev libwayland-bin wayland-protocols libcairo2-dev libpango1.0-dev
+  libwayland-dev libwayland-bin wayland-protocols libcairo2-dev libpango1.0-dev \
+  liblua5.4-dev
 ```
 
 ### Arch Linux
 
 ```sh
 sudo pacman -S --needed base-devel meson ninja pkgconf \
-  wayland wayland-protocols cairo pango
+  wayland wayland-protocols cairo pango lua
 ```
 
 `wayland-scanner` harus tersedia di `PATH` (di Debian/Ubuntu disediakan oleh paket `libwayland-bin`).
@@ -86,6 +87,29 @@ debar/
 ```
 
 File XML di `protocols/` berisi subset client-side versi 1 yang dibutuhkan oleh starter ini. Header dan source protokol digenerate otomatis oleh `wayland-scanner` ketika build. Paket `wayland-protocols` menyediakan definisi resmi `xdg-shell` yang diperlukan untuk tipe objek popup.
+
+## Konfigurasi (Lua)
+
+debar membaca `~/.config/debar/config.lua` (atau `$XDG_CONFIG_HOME/debar/config.lua`) saat start. Kalau file tidak ada, nilai default dipakai. Contoh lengkap ada di `examples/config.lua`:
+
+```sh
+mkdir -p ~/.config/debar
+cp examples/config.lua ~/.config/debar/config.lua
+```
+
+File ini Lua biasa dan harus diakhiri `return { ... }`. Semua opsi opsional.
+
+| Opsi | Nilai | Default |
+| --- | --- | --- |
+| `position` | `"top"` atau `"bottom"` | `"top"` |
+| `padding` | angka (semua sisi) atau tabel `{ top, bottom, left, right }` dalam px | `{ top = 9, bottom = 9, left = 24, right = 24 }` |
+| `margin` | sama seperti `padding` | `{ top = 6, bottom = 6, left = 5, right = 5 }` |
+
+- `padding` adalah jarak antara tepi bar dan pill di dalamnya. Tinggi bar mengikuti: `35 (tinggi pill) + top + bottom`, jadi default menghasilkan 53 px seperti sebelumnya.
+- `margin` adalah jarak antara bar dan tepi layar. Pada bar `top`, `margin.top` adalah jarak dari tepi atas layar dan `margin.bottom` adalah ruang kosong antara bar dan jendela; pada bar `bottom` sebaliknya. `margin.left` dan `margin.right` mengatur jarak ke tepi kiri/kanan, sehingga bar menyempit sesuai nilainya.
+- Opsi yang salah ketik, nilai di luar rentang, atau error sintaks Lua tidak menghentikan bar: pesan ditulis ke stderr dan opsi terkait memakai default.
+- `position = "left"` / `"right"` belum didukung (bar vertikal butuh layout sendiri); sementara dipakai `"top"` dengan peringatan.
+- Kalender popup muncul di bawah bar jika `position = "top"`, dan di atas bar jika `"bottom"`.
 
 ## Kalender popup
 

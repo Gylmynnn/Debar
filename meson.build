@@ -13,6 +13,8 @@ wayland_client = dependency('wayland-client')
 wayland_protocols = dependency('wayland-protocols')
 cairo = dependency('cairo')
 pangocairo = dependency('pangocairo')
+# Lua runs ~/.config/debar/config.lua. Any of 5.1-5.4 / LuaJIT works.
+lua = dependency(['lua5.4', 'lua-5.4', 'lua54', 'lua5.3', 'lua', 'luajit'])
 
 wayland_scanner = find_program('wayland-scanner')
 layer_shell_xml = files('protocols/wlr-layer-shell-unstable-v1.xml')
@@ -65,6 +67,6 @@ executable(
     xdg_shell_private_code,
   ],
   include_directories: inc,
-  dependencies: [wayland_client, cairo, pangocairo],
+  dependencies: [wayland_client, cairo, pangocairo, lua],
   install: true,
 )

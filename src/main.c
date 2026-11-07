@@ -5,7 +5,7 @@
 
 int main(void) {
   bar_config_t config;
-  config_load_defaults(&config);
+  config_load(&config);
 
   wayland_state_t wayland;
   if (!wayland_init(&wayland, &config)) {

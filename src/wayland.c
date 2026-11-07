@@ -42,6 +42,9 @@ static void dlog(const char *fmt, ...) {
 #define EVDEV_KEY_DOWN 108
 #define EVDEV_BTN_LEFT 0x110
 
+/* gap between the bar and the calendar popup, in px */
+#define CAL_BAR_GAP 6
+
 static void reap_list(bar_buffer_t **head) {
   bar_buffer_t **link = head;
   while (*link != NULL) {
@@ -151,16 +154,19 @@ static void popup_open(wayland_state_t *state) {
   double clock_w = 0.0;
   render_clock_span(config, &wayland_data, &clock_x, &clock_w);
 
-  const int screen_w = state->width + 2 * config->margin_side;
-  int left = config->margin_side + (int)clock_x;
-  if (left + CAL_WIDTH > screen_w - config->margin_side) {
-    left = screen_w - config->margin_side - CAL_WIDTH;
+  const int screen_w =
+      state->width + config->margin.left + config->margin.right;
+  int left = config->margin.left + (int)clock_x;
+  if (left + CAL_WIDTH > screen_w - config->margin.right) {
+    left = screen_w - config->margin.right - CAL_WIDTH;
   }
-  if (left < config->margin_side) {
-    left = config->margin_side;
+  if (left < config->margin.left) {
+    left = config->margin.left;
   }
-  /* bar margin + bar height + the same gap again below the bar */
-  const int top = config->margin_top + state->height + config->margin_top;
+  /* screen edge -> bar -> popup */
+  const bool at_bottom = config->position == BAR_POSITION_BOTTOM;
+  const int offset = (at_bottom ? config->margin.bottom : config->margin.top) +
+                     state->height + CAL_BAR_GAP;
 
   state->popup_surface = wl_compositor_create_surface(state->compositor);
   if (state->popup_surface == NULL) {
@@ -179,10 +185,13 @@ static void popup_open(wayland_state_t *state) {
   }
 
   zwlr_layer_surface_v1_set_size(state->popup_layer, CAL_WIDTH, CAL_HEIGHT);
-  zwlr_layer_surface_v1_set_anchor(state->popup_layer,
-                                   ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
-  zwlr_layer_surface_v1_set_margin(state->popup_layer, top, 0, 0, left);
+  zwlr_layer_surface_v1_set_anchor(
+      state->popup_layer,
+      (at_bottom ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
+                 : ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) |
+          ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+  zwlr_layer_surface_v1_set_margin(state->popup_layer, at_bottom ? 0 : offset,
+                                   0, at_bottom ? offset : 0, left);
   /* -1: position from the screen edge, ignore the bar's exclusive zone */
   zwlr_layer_surface_v1_set_exclusive_zone(state->popup_layer, -1);
   /* on_demand (layer-shell v4): keyboard focus after the first click on the
@@ -655,15 +664,25 @@ bool wayland_init(wayland_state_t *state, const bar_config_t *config) {
 
   zwlr_layer_surface_v1_set_size(state->layer_surface, 0,
                                  (uint32_t)config->height);
-  zwlr_layer_surface_v1_set_anchor(state->layer_surface,
-                                   ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-  /* Floating bar: margins leave the wallpaper visible around it. */
-  zwlr_layer_surface_v1_set_margin(state->layer_surface, config->margin_top,
-                                   config->margin_side, 0, config->margin_side);
+  const bool at_bottom = config->position == BAR_POSITION_BOTTOM;
+  zwlr_layer_surface_v1_set_anchor(
+      state->layer_surface,
+      (at_bottom ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
+                 : ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) |
+          ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+          ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+  /* Floating bar: margins leave the wallpaper visible around it. Only the
+   * margin on the anchored edge counts; the opposite one becomes extra
+   * exclusive space so windows keep that distance from the bar. */
+  const int outer = at_bottom ? config->margin.bottom : config->margin.top;
+  const int inner = at_bottom ? config->margin.top : config->margin.bottom;
+  zwlr_layer_surface_v1_set_margin(
+      state->layer_surface, at_bottom ? 0 : outer, config->margin.right,
+      at_bottom ? outer : 0, config->margin.left);
+  /* The compositor adds the anchored-edge margin to the exclusive zone
+   * itself, so reserve only the bar plus the inner gap. */
   zwlr_layer_surface_v1_set_exclusive_zone(state->layer_surface,
-                                           config->exclusive);
+                                           config->height + inner);
   zwlr_layer_surface_v1_set_keyboard_interactivity(
       state->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
   zwlr_layer_surface_v1_add_listener(state->layer_surface,
