@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Debian/Ubuntu-compatible binary (glibc 2.35 baseline from Ubuntu 22.04).
+  build-generic:
+    name: Build Debian/Ubuntu x86_64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkg-config \
+            libwayland-dev libwayland-bin wayland-protocols \
+            libcairo2-dev libpango1.0-dev liblua5.4-dev \
+            libglib2.0-dev libgdk-pixbuf-2.0-dev libxkbcommon-dev
+
+      - name: Build
+        run: |
+          meson setup build --buildtype=release
+          meson compile -C build
+          strip build/debar
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          asset="debar-linux-${arch}.tar.gz"
+
+          mkdir -p dist/debar
+          cp build/debar dist/debar/debar
+          cp README.md dist/debar/README.md
+          cp examples/config.lua dist/debar/config.lua
+
+          tar -C dist -czf "${asset}" debar
+          sha256sum "${asset}" > "${asset}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debar-generic
+          path: |
+            debar-linux-*.tar.gz
+            debar-linux-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # Arch Linux binary: Arch ships Lua as liblua5.4.so.5.4, while Debian/Ubuntu
+  # ship liblua5.4.so.0, so a single binary cannot serve both.
+  build-arch:
+    name: Build Arch Linux x86_64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build inside Arch Linux
+        run: |
+          docker run --rm \
+            -v "${PWD}:/src" \
+            -w /src \
+            archlinux:latest \
+            bash -c '
+              set -euo pipefail
+              pacman -Syu --noconfirm --needed \
+                base-devel meson ninja pkgconf \
+                wayland wayland-protocols cairo pango lua54 glib2 gdk-pixbuf2 libxkbcommon
+              meson setup build --buildtype=release
+              meson compile -C build
+              strip build/debar
+
+              arch="$(uname -m)"
+              asset="debar-linux-${arch}-arch.tar.gz"
+              mkdir -p dist/debar
+              cp build/debar dist/debar/debar
+              cp README.md dist/debar/README.md
+              cp examples/config.lua dist/debar/config.lua
+              tar -C dist -czf "${asset}" debar
+              sha256sum "${asset}" > "${asset}.sha256"
+            '
+
+      # The container runs as root; make the artifacts readable/writable by
+      # the runner user before upload.
+      - name: Fix artifact permissions
+        run: sudo chown -R "$(id -u):$(id -g)" dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debar-arch
+          path: |
+            debar-linux-*-arch.tar.gz
+            debar-linux-*-arch.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [build-generic, build-arch]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: debar ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
