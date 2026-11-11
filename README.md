@@ -4,6 +4,8 @@ A lightweight Wayland bar written in C with `wayland-client`, `wlr-layer-shell`,
 Cairo/Pango, and GDBus. The UI is a row of floating pills: workspaces, clock,
 dynamic system tray, Wi-Fi/Bluetooth, volume/brightness, CPU, and RAM.
 
+<img width="1546" height="69" alt="image" src="https://github.com/user-attachments/assets/47d5f898-a550-405c-8a0a-9a5b9b2ae72b" />
+
 ## Features
 
 - `top`/`bottom` layer surface with a transparent background and rounded pills.
