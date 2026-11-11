@@ -15,14 +15,12 @@ BINDIR := $(PREFIX)/bin
 
 all: build
 
-# First run: configure Meson. Afterwards only compile what changed.
 $(BUILD_DIR)/build.ninja:
 	meson setup $(BUILD_DIR)
 
 build: $(BUILD_DIR)/build.ninja
 	meson compile -C $(BUILD_DIR)
 
-# Full rebuild from scratch (kept from the original Makefile).
 i:
 	@rm -rf $(BUILD_DIR)
 	@meson setup $(BUILD_DIR)
