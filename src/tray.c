@@ -4,6 +4,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gio/gio.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +47,8 @@ typedef struct tray_item {
   cairo_surface_t *icon;
   guint props_sub;
   guint item_sub;
+  bool ready;  /* properties were read (or the read failed) at least once */
+  bool hidden; /* Wi-Fi / Bluetooth applet: the bar has its own popups */
 } tray_item_t;
 
 struct tray {
@@ -122,6 +127,89 @@ static int find_item_for_signal_locked(tray_t *t, const char *sender,
         g_strcmp0(t->items[i].service, sender) == 0) {
       return i;
     }
+  }
+  return -1;
+}
+
+/* ---------------- hidden items (Wi-Fi / Bluetooth) ----------------------- */
+
+/* The bar has its own Wi-Fi and Bluetooth popups, so the applets that would
+ * show the same thing in the tray (nm-applet, blueman, ...) are kept out of
+ * it. They stay in the item list so D-Bus signals and removal keep working;
+ * they are only skipped when the tray is counted, drawn or clicked. */
+static const char *const HIDDEN_NAME_PARTS[] = {
+    "blueman",    "bluetooth", "blueberry", "bluedevil", "nm-applet",
+    "nm_applet",  "nm-tray",   "nm-connection", "networkmanager",
+    "network-manager", "network-wireless",
+};
+
+/* Icon names NetworkManager applets use for their state ("nm-signal-75",
+ * "nm-no-connection", "network-offline", ...). */
+static const char *const HIDDEN_ICON_PREFIXES[] = {
+    "nm-", "network-wireless", "network-wired", "network-offline",
+    "network-idle", "network-transmit", "network-error", "network-no-route",
+};
+
+static bool contains_icase(const char *haystack, const char *needle) {
+  if (haystack == NULL || haystack[0] == '\0') {
+    return false;
+  }
+  char *h = g_ascii_strdown(haystack, -1);
+  const bool found = strstr(h, needle) != NULL;
+  g_free(h);
+  return found;
+}
+
+/* Decides from the item's own properties (Id, Title, IconName) and from its
+ * D-Bus name/path. */
+static bool item_is_hidden(GVariant *properties, const char *service,
+                           const char *path) {
+  const char *fields[3] = {NULL, NULL, NULL};
+  (void)g_variant_lookup(properties, "Id", "&s", &fields[0]);
+  (void)g_variant_lookup(properties, "Title", "&s", &fields[1]);
+  (void)g_variant_lookup(properties, "IconName", "&s", &fields[2]);
+
+  for (size_t i = 0; i < G_N_ELEMENTS(HIDDEN_NAME_PARTS); i++) {
+    const char *part = HIDDEN_NAME_PARTS[i];
+    if (contains_icase(fields[0], part) || contains_icase(fields[1], part) ||
+        contains_icase(fields[2], part) || contains_icase(path, part) ||
+        contains_icase(service, part)) {
+      return true;
+    }
+  }
+
+  if (fields[2] != NULL) {
+    char *icon = g_ascii_strdown(fields[2], -1);
+    bool hide = false;
+    for (size_t i = 0; i < G_N_ELEMENTS(HIDDEN_ICON_PREFIXES) && !hide; i++) {
+      hide = g_str_has_prefix(icon, HIDDEN_ICON_PREFIXES[i]);
+    }
+    g_free(icon);
+    if (hide) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool item_visible(const tray_item_t *item) {
+  return item->ready && !item->hidden;
+}
+
+/* Maps the index among the visible items to the index in items[], or -1. */
+static int visible_to_real_locked(const tray_t *t, int visible) {
+  if (visible < 0) {
+    return -1;
+  }
+  int seen = 0;
+  for (int i = 0; i < t->count; i++) {
+    if (!item_visible(&t->items[i])) {
+      continue;
+    }
+    if (seen == visible) {
+      return i;
+    }
+    seen++;
   }
   return -1;
 }
@@ -731,6 +819,52 @@ static cairo_surface_t *icon_from_properties(GVariant *properties,
   return surface;
 }
 
+/* Icons are drawn at ~22 px. Apps often send 128-512 px pixmaps; keeping them
+ * as they are wastes up to a megabyte each and makes every frame rescale a
+ * huge source, so anything bigger than TRAY_ICON_LOAD_SIZE is shrunk once. */
+static cairo_surface_t *limit_icon_size(cairo_surface_t *icon) {
+  if (icon == NULL) {
+    return NULL;
+  }
+  const int w = cairo_image_surface_get_width(icon);
+  const int h = cairo_image_surface_get_height(icon);
+  const int longest = w > h ? w : h;
+  if (w <= 0 || h <= 0 || longest <= TRAY_ICON_LOAD_SIZE) {
+    return icon;
+  }
+
+  const double scale = (double)TRAY_ICON_LOAD_SIZE / (double)longest;
+  int nw = (int)((double)w * scale + 0.5);
+  int nh = (int)((double)h * scale + 0.5);
+  nw = nw < 1 ? 1 : nw;
+  nh = nh < 1 ? 1 : nh;
+
+  cairo_surface_t *small =
+      cairo_image_surface_create(CAIRO_FORMAT_ARGB32, nw, nh);
+  if (cairo_surface_status(small) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy(small);
+    return icon;
+  }
+
+  cairo_t *cr = cairo_create(small);
+  cairo_scale(cr, (double)nw / (double)w, (double)nh / (double)h);
+  cairo_set_source_surface(cr, icon, 0.0, 0.0);
+  cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BEST);
+  cairo_paint(cr);
+  cairo_destroy(cr);
+
+  cairo_surface_destroy(icon);
+  return small;
+}
+
+/* Icon lookup parses theme files and decodes images, which leaves freed but
+ * unreturned heap behind; hand it back to the OS. */
+static void trim_heap(void) {
+#ifdef __GLIBC__
+  malloc_trim(0);
+#endif
+}
+
 /* ---------------- D-Bus item handling ------------------------------------ */
 
 static char *resolve_owner(GDBusConnection *connection, const char *service) {
@@ -776,6 +910,22 @@ static void refresh_item(tray_t *t, const char *service, const char *path) {
          error != NULL ? error->message : "unknown error");
     g_clear_error(&error);
     g_object_unref(connection);
+
+    /* An item that cannot be read still gets its (empty) slot, as before. */
+    bool shown = false;
+    g_mutex_lock(&t->mutex);
+    int failed = find_item_exact_locked(t, service, path);
+    if (failed < 0) {
+      failed = find_item_for_signal_locked(t, service, path);
+    }
+    if (failed >= 0 && !t->items[failed].ready) {
+      t->items[failed].ready = true;
+      shown = true;
+    }
+    g_mutex_unlock(&t->mutex);
+    if (shown) {
+      tray_notify(t);
+    }
     return;
   }
 
@@ -789,7 +939,9 @@ static void refresh_item(tray_t *t, const char *service, const char *path) {
     theme_copy = g_strdup(theme_path);
   }
 
-  cairo_surface_t *icon = icon_from_properties(properties, theme_copy);
+  cairo_surface_t *icon =
+      limit_icon_size(icon_from_properties(properties, theme_copy));
+  const bool hidden = item_is_hidden(properties, service, path);
 
   g_variant_unref(properties);
   g_variant_unref(reply);
@@ -803,6 +955,12 @@ static void refresh_item(tray_t *t, const char *service, const char *path) {
   }
   if (index >= 0) {
     tray_item_t *item = &t->items[index];
+    if (hidden != item->hidden || !item->ready) {
+      tlog("debar tray: %s%s is %s", service, path,
+           hidden ? "hidden (Wi-Fi/Bluetooth applet)" : "shown");
+    }
+    item->hidden = hidden;
+    item->ready = true;
     if (icon != NULL) {
       if (item->icon != NULL) {
         cairo_surface_destroy(item->icon);
@@ -827,6 +985,7 @@ static void refresh_item(tray_t *t, const char *service, const char *path) {
   if (changed) {
     tray_notify(t);
   }
+  trim_heap();
 }
 
 static void on_item_signal(GDBusConnection *connection,
@@ -1214,7 +1373,12 @@ int tray_count(tray_t *t) {
     return 0;
   }
   g_mutex_lock(&t->mutex);
-  const int count = t->count;
+  int count = 0;
+  for (int i = 0; i < t->count; i++) {
+    if (item_visible(&t->items[i])) {
+      count++;
+    }
+  }
   g_mutex_unlock(&t->mutex);
   return count;
 }
@@ -1225,11 +1389,14 @@ int tray_snapshot(tray_t *t, cairo_surface_t **out, int max) {
   }
 
   g_mutex_lock(&t->mutex);
-  int count = t->count < max ? t->count : max;
-  for (int i = 0; i < count; i++) {
-    out[i] = t->items[i].icon != NULL
-                 ? cairo_surface_reference(t->items[i].icon)
-                 : NULL;
+  int count = 0;
+  for (int i = 0; i < t->count && count < max; i++) {
+    if (!item_visible(&t->items[i])) {
+      continue;
+    }
+    out[count++] = t->items[i].icon != NULL
+                       ? cairo_surface_reference(t->items[i].icon)
+                       : NULL;
   }
   g_mutex_unlock(&t->mutex);
   return count;
@@ -1274,14 +1441,16 @@ void tray_activate(tray_t *t, int index, bool secondary) {
 
   tray_activation_t *activation = g_new0(tray_activation_t, 1);
   g_mutex_lock(&t->mutex);
-  if (index >= t->count || t->connection == NULL) {
+  /* index counts visible items only (hidden applets are skipped) */
+  const int real = visible_to_real_locked(t, index);
+  if (real < 0 || t->connection == NULL) {
     g_mutex_unlock(&t->mutex);
     g_free(activation);
     return;
   }
   activation->connection = g_object_ref(t->connection);
-  activation->service = g_strdup(t->items[index].service);
-  activation->path = g_strdup(t->items[index].path);
+  activation->service = g_strdup(t->items[real].service);
+  activation->path = g_strdup(t->items[real].path);
   activation->secondary = secondary;
   g_mutex_unlock(&t->mutex);
 

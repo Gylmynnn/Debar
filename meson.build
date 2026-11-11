@@ -1,7 +1,7 @@
 project(
   'debar',
   'c',
-  version: '0.1.0',
+  version: '0.5.0',
   meson_version: '>=0.60.0',
   default_options: [
     'c_std=c11',
@@ -17,8 +17,13 @@ pangocairo = dependency('pangocairo')
 gio = dependency('gio-2.0')
 # Optional: loads PNG/SVG icons from icon themes (SVG needs librsvg's loader).
 gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: false)
+# Typing the Wi-Fi password needs the compositor's keymap.
+xkbcommon = dependency('xkbcommon')
 # Lua runs ~/.config/debar/config.lua. Any of 5.1-5.4 / LuaJIT works.
 lua = dependency(['lua5.4', 'lua-5.4', 'lua54', 'lua5.3', 'lua', 'luajit'])
+
+# cos/sin in render.c need libm; some toolchains only link it transitively.
+m_dep = meson.get_compiler('c').find_library('m', required: false)
 
 tray_deps = [gio]
 tray_c_args = []
@@ -70,8 +75,11 @@ executable(
     'src/calendar.c',
     'src/config.c',
     'src/ipc.c',
+    'src/jobs.c',
     'src/modules.c',
+    'src/netmgr.c',
     'src/render.c',
+    'src/sysinfo.c',
     'src/tray.c',
     'src/wayland.c',
     layer_shell_client_header,
@@ -80,6 +88,6 @@ executable(
   ],
   include_directories: inc,
   c_args: tray_c_args,
-  dependencies: [wayland_client, cairo, pangocairo, lua] + tray_deps,
+  dependencies: [wayland_client, cairo, pangocairo, lua, xkbcommon, m_dep] + tray_deps,
   install: true,
 )

@@ -1,15 +1,32 @@
+#define _GNU_SOURCE
 #include "modules.h"
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+extern char **environ;
+
+/* Spawning wpctl costs real CPU, so the volume is polled every other tick
+ * (wheel actions force an immediate re-read); the battery is not drawn yet and
+ * changes slowly. */
+#define VOLUME_POLL_TICKS 2
+#define BATTERY_POLL_TICKS 30
+#define COMMAND_TIMEOUT_MS 300
+
+static bool g_volume_dirty = true;
+static bool g_levels_held = false;
 
 static void update_clock(modules_data_t *d) {
   time_t now = time(NULL);
@@ -95,54 +112,113 @@ static void update_mem(modules_data_t *d) {
   snprintf(d->mem, sizeof(d->mem), "%.1f GiB", used_gib);
 }
 
+/* Runs argv directly (no shell) and captures up to size-1 bytes of stdout.
+ * A hung audio server is cut off after timeout_ms, so it can never freeze the
+ * bar. Returns true when some output arrived in time. */
+static bool capture_command(char *const argv[], char *out, size_t size,
+                            int timeout_ms) {
+  out[0] = '\0';
+
+  int fds[2];
+  if (pipe2(fds, O_CLOEXEC) != 0) {
+    return false;
+  }
+
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
+                                   O_WRONLY, 0);
+
+  pid_t pid = 0;
+  const int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  close(fds[1]);
+  if (rc != 0) {
+    close(fds[0]);
+    return false;
+  }
+
+  size_t used = 0;
+  bool timed_out = false;
+  struct pollfd pfd = {.fd = fds[0], .events = POLLIN, .revents = 0};
+  while (used + 1 < size) {
+    const int ready = poll(&pfd, 1, timeout_ms);
+    if (ready < 0 && errno == EINTR) {
+      continue;
+    }
+    if (ready <= 0) {
+      timed_out = true;
+      break;
+    }
+    const ssize_t n = read(fds[0], out + used, size - 1 - used);
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      break; /* EOF */
+    }
+    used += (size_t)n;
+  }
+  out[used] = '\0';
+  close(fds[0]);
+
+  int status = 0;
+  if (timed_out || waitpid(pid, &status, WNOHANG) == 0) {
+    kill(pid, SIGKILL);
+    (void)waitpid(pid, &status, 0);
+  }
+  return used > 0 && !timed_out;
+}
+
 static void update_volume(modules_data_t *d) {
   d->volume[0] = '\0';
+  d->volume_muted = false;
 
   /* PipeWire/WirePlumber first: "Volume: 0.42" (may end with [MUTED]). */
-  FILE *f = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
-  if (f != NULL) {
-    char line[128];
-    if (fgets(line, sizeof(line), f) != NULL) {
-      const char *p = strstr(line, "Volume:");
-      if (p != NULL) {
-        int value = (int)(atof(p + 7) * 100.0 + 0.5);
-        if (value < 0) {
-          value = 0;
-        } else if (value > 100) {
-          value = 100;
-        }
-        snprintf(d->volume, sizeof(d->volume), "%d%%", value);
+  char line[128];
+  char *const wpctl[] = {"wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@", NULL};
+  if (capture_command(wpctl, line, sizeof(line), COMMAND_TIMEOUT_MS)) {
+    const char *p = strstr(line, "Volume:");
+    if (p != NULL) {
+      int value = (int)(atof(p + 7) * 100.0 + 0.5);
+      if (value < 0) {
+        value = 0;
+      } else if (value > 100) {
+        value = 100;
       }
-    }
-    pclose(f);
-    if (d->volume[0] != '\0') {
+      snprintf(d->volume, sizeof(d->volume), "%d%%", value);
+      d->volume_muted = strstr(line, "[MUTED]") != NULL;
       return;
     }
   }
 
   /* Fallback: pactl (pipewire-pulse or PulseAudio). */
-  f = popen("pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null", "r");
-  if (f == NULL) {
+  char buf[256];
+  char *const pactl[] = {"pactl", "get-sink-volume", "@DEFAULT_SINK@", NULL};
+  if (!capture_command(pactl, buf, sizeof(buf), COMMAND_TIMEOUT_MS)) {
     return;
   }
+  char *percent = strchr(buf, '%');
+  if (percent != NULL && percent > buf) {
+    char *start = percent - 1;
+    while (start >= buf && isdigit((unsigned char)*start)) {
+      start--;
+    }
+    start++;
 
-  char buf[256];
-  if (fgets(buf, sizeof(buf), f) != NULL) {
-    char *percent = strchr(buf, '%');
-    if (percent != NULL && percent > buf) {
-      char *start = percent - 1;
-      while (start >= buf && isdigit((unsigned char)*start)) {
-        start--;
-      }
-      start++;
-
-      int value = 0;
-      if (sscanf(start, "%d", &value) == 1 && value >= 0 && value <= 999) {
-        snprintf(d->volume, sizeof(d->volume), "%d%%", value);
-      }
+    int value = 0;
+    if (sscanf(start, "%d", &value) == 1 && value >= 0 && value <= 999) {
+      snprintf(d->volume, sizeof(d->volume), "%d%%", value);
     }
   }
-  pclose(f);
+
+  /* pactl reports mute separately: "Mute: yes". */
+  char mute[64];
+  char *const pactl_mute[] = {"pactl", "get-sink-mute", "@DEFAULT_SINK@", NULL};
+  d->volume_muted = capture_command(pactl_mute, mute, sizeof(mute),
+                                    COMMAND_TIMEOUT_MS) &&
+                    strstr(mute, "yes") != NULL;
 }
 
 static int read_int_file(const char *path) {
@@ -249,12 +325,22 @@ void modules_update(modules_data_t *d) {
     return;
   }
 
+  static unsigned tick = 0;
+
   update_clock(d);
   update_cpu(d);
   update_mem(d);
-  update_volume(d);
-  update_brightness(d);
-  update_battery(d);
+  if (!g_levels_held) {
+    if (g_volume_dirty || tick % VOLUME_POLL_TICKS == 0) {
+      update_volume(d);
+      g_volume_dirty = false;
+    }
+    update_brightness(d);
+  }
+  if (tick % BATTERY_POLL_TICKS == 0) {
+    update_battery(d);
+  }
+  tick++;
 }
 
 void modules_init(modules_data_t *d) {
@@ -326,6 +412,7 @@ void modules_volume_step(modules_data_t *d, int delta_percent) {
            "pactl set-sink-volume @DEFAULT_SINK@ %c%d%%",
            step, sign, sign, step);
   spawn_async(cmd);
+  g_volume_dirty = true; /* re-read the real value on the next update */
 
   if (d != NULL) {
     bump_percent(d->volume, sizeof(d->volume), delta_percent);
@@ -345,5 +432,60 @@ void modules_brightness_step(modules_data_t *d, int delta_percent) {
 
   if (d != NULL) {
     bump_percent(d->brightness, sizeof(d->brightness), delta_percent);
+  }
+}
+
+/* ---- absolute actions: popup sliders, presets and mute -------------------- */
+
+void modules_hold_levels(bool hold) {
+  g_levels_held = hold;
+  if (!hold) {
+    g_volume_dirty = true; /* reconcile with the real values at the next tick */
+  }
+}
+
+void modules_volume_set(modules_data_t *d, int percent) {
+  if (percent < 0) {
+    percent = 0;
+  } else if (percent > 100) {
+    percent = 100;
+  }
+
+  char cmd[192];
+  snprintf(cmd, sizeof(cmd),
+           "wpctl set-volume @DEFAULT_AUDIO_SINK@ %d%% 2>/dev/null || "
+           "pactl set-sink-volume @DEFAULT_SINK@ %d%%",
+           percent, percent);
+  spawn_async(cmd);
+  g_volume_dirty = true;
+
+  if (d != NULL && d->volume[0] != '\0') {
+    snprintf(d->volume, sizeof(d->volume), "%d%%", percent);
+  }
+}
+
+void modules_volume_toggle_mute(modules_data_t *d) {
+  spawn_async("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle 2>/dev/null || "
+              "pactl set-sink-mute @DEFAULT_SINK@ toggle");
+  g_volume_dirty = true;
+
+  if (d != NULL) {
+    d->volume_muted = !d->volume_muted;
+  }
+}
+
+void modules_brightness_set(modules_data_t *d, int percent) {
+  if (percent < 1) {
+    percent = 1;
+  } else if (percent > 100) {
+    percent = 100;
+  }
+
+  char cmd[128];
+  snprintf(cmd, sizeof(cmd), "brightnessctl -q set %d%%", percent);
+  spawn_async(cmd);
+
+  if (d != NULL && d->brightness[0] != '\0') {
+    snprintf(d->brightness, sizeof(d->brightness), "%d%%", percent);
   }
 }

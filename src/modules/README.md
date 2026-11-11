@@ -1,12 +1,15 @@
 # Modules
 
-Folder ini disiapkan untuk implementasi modul status. Interface bersama tersedia di `include/module.h`.
+This folder is reserved for the status module implementation. The shared
+interface is available in `include/module.h`.
 
-Rencana modul pertama:
+Planned first modules:
 
-- `clock.c`: update memakai `timerfd` setiap satu detik.
-- `battery.c`: baca `/sys/class/power_supply/` dengan interval beberapa detik.
-- `volume.c`: event-driven lewat PipeWire atau PulseAudio.
-- `workspace.c`: subscribe ke protokol workspace compositor (misalnya Sway IPC atau ext-workspace bila tersedia).
+- `clock.c`: update once per second using `timerfd`.
+- `battery.c`: read `/sys/class/power_supply/` every few seconds.
+- `volume.c`: event-driven through PipeWire or PulseAudio.
+- `workspace.c`: subscribe to the compositor workspace protocol (for example
+  Sway IPC, or `ext-workspace` when available).
 
-Modul sebaiknya hanya memperbarui data saat berubah dan menandai `dirty`; renderer yang menentukan kapan perlu redraw.
+Modules should only update their data when it changes and mark it `dirty`; the
+renderer decides when a redraw is needed.

@@ -11,7 +11,7 @@
  * published through a small mutex-protected snapshot, and a self-pipe wakes
  * the Wayland poll loop when the list changes. */
 
-/* Maximum number of icons the tray pill can display. */
+/* Maximum number of icons the tray can display. */
 #define DEBAR_TRAY_MAX_ITEMS 12
 
 typedef struct tray tray_t;

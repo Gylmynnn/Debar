@@ -6,12 +6,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include "ipc.h"
+#include "jobs.h"
+#include "netmgr.h"
+#include "sysinfo.h"
 
 static modules_data_t wayland_data; /* live data, updated every second */
+
+/* Copies the radio state known by the network managers into the bar data so
+ * the Wi-Fi / Bluetooth icons can dim. Returns true when something changed. */
+static bool sync_net_icons(void) {
+  const int wifi = netmgr_wifi_icon_state();
+  const int bt = netmgr_bt_icon_state();
+  const bool changed = wifi != wayland_data.net_wifi || bt != wayland_data.net_bt;
+  wayland_data.net_wifi = wifi;
+  wayland_data.net_bt = bt;
+  return changed;
+}
 
 static int g_debug = -1;
 static void dlog(const char *fmt, ...) {
@@ -33,8 +49,10 @@ static void dlog(const char *fmt, ...) {
  * dependency is needed for these few fixed keys. */
 #define EVDEV_KEY_ESC 1
 #define EVDEV_KEY_Q 16
+#define EVDEV_KEY_BACKSPACE 14
 #define EVDEV_KEY_ENTER 28
 #define EVDEV_KEY_S 31
+#define EVDEV_KEY_M 50
 #define EVDEV_KEY_KPENTER 96
 #define EVDEV_KEY_UP 103
 #define EVDEV_KEY_LEFT 105
@@ -43,18 +61,101 @@ static void dlog(const char *fmt, ...) {
 #define EVDEV_BTN_LEFT 0x110
 #define EVDEV_BTN_MIDDLE 0x112
 
-/* gap between the bar and the calendar popup, in px */
+/* a mouse wheel sends ~10 axis units per notch */
+#define WHEEL_UNITS_PER_NOTCH 10.0
+
+/* gap between the bar and a popup, in px */
 #define CAL_BAR_GAP 6
 
-static void reap_list(bar_buffer_t **head) {
+/* An early main-loop wakeup (0 = none): wheel actions use it to re-read the
+ * volume, and a freshly opened CPU popup uses it to get its first real
+ * sample after a fraction of a second instead of a full tick. */
+static long g_refresh_at_ms = 0;
+
+/* Volume / brightness popup: every level change is a process spawn, so a
+ * slider drag sends at most one command per LEVEL_DRAG_SEND_MS; the newest
+ * value that had to wait is sent when the button is released. */
+#define LEVEL_DRAG_SEND_MS 60
+#define LEVEL_RECONCILE_MS 120
+static long g_level_sent_ms = 0;
+static int g_level_pending = -1;
+
+/* Losing the keyboard focus dismisses a popup (see keyboard_leave), but a
+ * compositor can also move the focus while the user is merely on the way to
+ * the popup: some give an on-demand layer the focus as soon as it appears and
+ * take it back when the pointer crosses the window under the gap between bar
+ * and popup (focus-follows-mouse), which made the popup vanish before it could
+ * be used. Focus loss is therefore ignored while the pointer has not reached
+ * the popup yet (for a short while only, so a click elsewhere still closes it),
+ * and during / right after a slider drag, which may end outside the popup. */
+#define POPUP_REACH_GRACE_MS 2000
+#define DRAG_END_GRACE_MS 500
+static long g_popup_opened_ms = 0;
+static bool g_popup_pointer_seen = false;
+static long g_drag_end_ms = 0;
+
+static long mono_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+#define SYSINFO_FIRST_SAMPLE_MS 300
+
+static bool popup_is_net(popup_kind_t kind) {
+  return kind == POPUP_WIFI || kind == POPUP_BLUETOOTH;
+}
+
+static bool popup_is_sys(popup_kind_t kind) {
+  return kind == POPUP_CPU || kind == POPUP_MEM;
+}
+
+static bool popup_is_level(popup_kind_t kind) {
+  return kind == POPUP_VOLUME || kind == POPUP_BRIGHTNESS;
+}
+
+/* "42%" -> 42; an empty label (no audio server / no backlight) -> -1. */
+static int label_percent(const char *label) {
+  return label[0] != '\0' ? atoi(label) : -1;
+}
+
+/* At most this many released buffers are kept around for reuse. */
+#define IDLE_BUFFERS_MAX 2
+
+/* Returns a released buffer of the given size from the list, or creates one
+ * (linked at the head). Reusing buffers avoids a memfd + mmap + pool +
+ * wl_buffer round trip per frame. */
+static bar_buffer_t *acquire_buffer(struct wl_shm *shm, bar_buffer_t **head,
+                                    int width, int height) {
+  for (bar_buffer_t *b = *head; b != NULL; b = b->next) {
+    if (!b->busy && b->width == width && b->height == height) {
+      return b;
+    }
+  }
+  bar_buffer_t *created = render_buffer_create(shm, width, height);
+  if (created != NULL) {
+    created->next = *head;
+    *head = created;
+  }
+  return created;
+}
+
+/* Frees released buffers of another size and any surplus idle ones. */
+static void reap_idle_buffers(bar_buffer_t **head, int width, int height,
+                              bar_buffer_t **active) {
+  int idle = 0;
   bar_buffer_t **link = head;
   while (*link != NULL) {
-    bar_buffer_t *buffer = *link;
-    if (buffer->retired && !buffer->busy) {
-      *link = buffer->next;
-      render_buffer_destroy(buffer);
+    bar_buffer_t *b = *link;
+    const bool stale = b->width != width || b->height != height;
+    if (!b->busy && (stale || ++idle > IDLE_BUFFERS_MAX)) {
+      *link = b->next;
+      if (active != NULL && *active == b) {
+        *active = NULL;
+      }
+      render_buffer_destroy(b);
     } else {
-      link = &buffer->next;
+      link = &b->next;
     }
   }
 }
@@ -64,33 +165,139 @@ static void popup_redraw(wayland_state_t *state) {
     return;
   }
 
-  bar_buffer_t *buffer =
-      render_buffer_create(state->shm, CAL_WIDTH, CAL_HEIGHT);
+  bar_buffer_t *buffer = acquire_buffer(state->shm, &state->popup_buffers,
+                                        state->popup_w, state->popup_h);
   if (buffer == NULL) {
-    fprintf(stderr, "debar: failed to create calendar buffer\n");
+    fprintf(stderr, "debar: failed to create popup buffer\n");
     return;
   }
 
-  render_calendar(buffer, state->config, &state->calendar);
-
-  if (state->popup_active != NULL) {
-    state->popup_active->retired = true;
+  switch (state->popup_kind) {
+  case POPUP_CALENDAR:
+    render_calendar(buffer, state->config, &state->calendar);
+    break;
+  case POPUP_WIFI:
+    render_wifi_popup(buffer, state->config, netmgr_wifi(), &state->netui);
+    break;
+  case POPUP_BLUETOOTH:
+    render_bt_popup(buffer, state->config, netmgr_bt(), &state->netui);
+    break;
+  case POPUP_CPU:
+    render_cpu_popup(buffer, state->config, sysinfo_cpu());
+    break;
+  case POPUP_MEM:
+    render_mem_popup(buffer, state->config, sysinfo_mem());
+    break;
+  case POPUP_VOLUME:
+    render_volume_popup(buffer, state->config,
+                        label_percent(wayland_data.volume),
+                        wayland_data.volume_muted, &state->levelui);
+    break;
+  case POPUP_BRIGHTNESS:
+    render_brightness_popup(buffer, state->config,
+                            label_percent(wayland_data.brightness),
+                            &state->levelui);
+    break;
+  case POPUP_NONE:
+    return;
   }
+
   buffer->busy = true;
-  buffer->next = state->popup_buffers;
-  state->popup_buffers = buffer;
   state->popup_active = buffer;
 
   wl_surface_attach(state->popup_surface, buffer->wl_buffer, 0, 0);
-  wl_surface_damage(state->popup_surface, 0, 0, CAL_WIDTH, CAL_HEIGHT);
+  wl_surface_damage(state->popup_surface, 0, 0, state->popup_w, state->popup_h);
   wl_surface_commit(state->popup_surface);
   wl_display_flush(state->display);
 }
+
+/* ---- Wi-Fi password entry --------------------------------------------- */
+
+static void wipe(void *p, size_t n) {
+  volatile unsigned char *v = p;
+  while (n-- > 0) {
+    *v++ = 0;
+  }
+}
+
+static void xkb_release(wayland_state_t *state) {
+  if (state->xkb_state != NULL) {
+    xkb_state_unref(state->xkb_state);
+    state->xkb_state = NULL;
+  }
+  if (state->xkb_keymap != NULL) {
+    xkb_keymap_unref(state->xkb_keymap);
+    state->xkb_keymap = NULL;
+  }
+  if (state->xkb_context != NULL) {
+    xkb_context_unref(state->xkb_context);
+    state->xkb_context = NULL;
+  }
+}
+
+/* Compiles the compositor's keymap, only while the password prompt is open
+ * (a compiled keymap costs a few hundred KB we do not need the rest of the
+ * time). */
+static void xkb_prepare(wayland_state_t *state) {
+  xkb_release(state);
+  if (state->keymap_fd < 0 || state->keymap_size == 0) {
+    return;
+  }
+
+  void *map = mmap(NULL, state->keymap_size, PROT_READ, MAP_PRIVATE,
+                   state->keymap_fd, 0);
+  if (map == MAP_FAILED) {
+    return;
+  }
+
+  state->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  if (state->xkb_context != NULL) {
+    state->xkb_keymap = xkb_keymap_new_from_string(
+        state->xkb_context, (const char *)map, XKB_KEYMAP_FORMAT_TEXT_V1,
+        XKB_KEYMAP_COMPILE_NO_FLAGS);
+  }
+  munmap(map, state->keymap_size);
+
+  if (state->xkb_keymap != NULL) {
+    state->xkb_state = xkb_state_new(state->xkb_keymap);
+  }
+  if (state->xkb_state != NULL) {
+    xkb_state_update_mask(state->xkb_state, state->mods_depressed,
+                          state->mods_latched, state->mods_locked, 0, 0,
+                          state->mods_group);
+  } else {
+    xkb_release(state);
+  }
+}
+
+static void password_enter(wayland_state_t *state, const char *ssid) {
+  netpopup_ui_t *ui = &state->netui;
+  ui->password_mode = true;
+  snprintf(ui->password_ssid, sizeof(ui->password_ssid), "%s", ssid);
+  ui->password_len = 0;
+  wipe(state->password, sizeof(state->password));
+  xkb_prepare(state);
+}
+
+static void password_leave(wayland_state_t *state, bool cancelled) {
+  netpopup_ui_t *ui = &state->netui;
+  ui->password_mode = false;
+  ui->password_len = 0;
+  wipe(state->password, sizeof(state->password));
+  xkb_release(state);
+  if (cancelled) {
+    netmgr_wifi_cancel_password();
+  }
+}
+
+static void level_end_drag(wayland_state_t *state);
 
 static void popup_close(wayland_state_t *state) {
   if (state->popup_surface == NULL) {
     return;
   }
+
+  level_end_drag(state); /* sends the last throttled value, releases the hold */
 
   if (state->pointer_surface == state->popup_surface) {
     state->pointer_surface = NULL;
@@ -106,6 +313,13 @@ static void popup_close(wayland_state_t *state) {
   wl_surface_destroy(state->popup_surface);
   state->popup_surface = NULL;
   state->popup_configured = false;
+  state->popup_kind = POPUP_NONE;
+  sysinfo_close(); /* stops the /proc sampling and frees its tables */
+  if (state->netui.password_mode) {
+    password_leave(state, true);
+  }
+  memset(&state->netui, 0, sizeof(state->netui));
+  memset(&state->levelui, 0, sizeof(state->levelui));
 
   bar_buffer_t *buffer = state->popup_buffers;
   while (buffer != NULL) {
@@ -134,6 +348,7 @@ static void popup_layer_configure(void *data,
 static void popup_layer_closed(void *data,
                                struct zwlr_layer_surface_v1 *layer_surface) {
   (void)layer_surface;
+  dlog("debar debug: popup closed: compositor closed its layer surface");
   popup_close((wayland_state_t *)data);
 }
 
@@ -142,24 +357,58 @@ static const struct zwlr_layer_surface_v1_listener popup_layer_listener = {
     .closed = popup_layer_closed,
 };
 
-/* Opens the calendar just below the bar, left-aligned with the clock pill. */
-static void popup_open(wayland_state_t *state) {
-  if (state->popup_surface != NULL || !state->configured) {
+/* Opens a popup just below (or above) the bar. The calendar is left-aligned
+ * with the clock pill; the other popups are centered on the icon or pill that
+ * opened them (anchor_x is its x inside the bar). */
+static void popup_open(wayland_state_t *state, popup_kind_t kind,
+                       double anchor_x) {
+  if (state->popup_surface != NULL || !state->configured ||
+      kind == POPUP_NONE) {
     return;
   }
 
   const bar_config_t *config = state->config;
-  calendar_goto_today(&state->calendar);
+  int popup_w = NETPOPUP_WIDTH;
+  int popup_h = NETPOPUP_HEIGHT;
+  switch (kind) {
+  case POPUP_CALENDAR:
+    popup_w = CAL_WIDTH;
+    popup_h = CAL_HEIGHT;
+    break;
+  case POPUP_CPU:
+    popup_w = SYSPOPUP_WIDTH;
+    popup_h = render_cpu_popup_height(sysinfo_cpu_count());
+    break;
+  case POPUP_MEM:
+    popup_w = SYSPOPUP_WIDTH;
+    popup_h = render_mem_popup_height();
+    break;
+  case POPUP_VOLUME:
+  case POPUP_BRIGHTNESS:
+    popup_w = LEVELPOPUP_WIDTH;
+    popup_h = render_level_popup_height(kind == POPUP_VOLUME);
+    break;
+  case POPUP_WIFI:
+  case POPUP_BLUETOOTH:
+  case POPUP_NONE:
+    break;
+  }
 
-  double clock_x = 0.0;
-  double clock_w = 0.0;
-  render_clock_span(config, &wayland_data, &clock_x, &clock_w);
+  int left = 0;
+  if (kind == POPUP_CALENDAR) {
+    calendar_goto_today(&state->calendar);
+    double clock_x = 0.0;
+    double clock_w = 0.0;
+    render_clock_span(config, &wayland_data, &clock_x, &clock_w);
+    left = config->margin.left + (int)clock_x;
+  } else {
+    left = config->margin.left + (int)(anchor_x - popup_w / 2.0);
+  }
 
   const int screen_w =
       state->width + config->margin.left + config->margin.right;
-  int left = config->margin.left + (int)clock_x;
-  if (left + CAL_WIDTH > screen_w - config->margin.right) {
-    left = screen_w - config->margin.right - CAL_WIDTH;
+  if (left + popup_w > screen_w - config->margin.right) {
+    left = screen_w - config->margin.right - popup_w;
   }
   if (left < config->margin.left) {
     left = config->margin.left;
@@ -171,21 +420,43 @@ static void popup_open(wayland_state_t *state) {
 
   state->popup_surface = wl_compositor_create_surface(state->compositor);
   if (state->popup_surface == NULL) {
-    fprintf(stderr, "debar: cannot create calendar surface\n");
+    fprintf(stderr, "debar: cannot create popup surface\n");
     return;
   }
 
   state->popup_layer = zwlr_layer_shell_v1_get_layer_surface(
       state->layer_shell, state->popup_surface, NULL,
-      ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "debar-calendar");
+      ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "debar-popup");
   if (state->popup_layer == NULL) {
-    fprintf(stderr, "debar: cannot create calendar layer surface\n");
+    fprintf(stderr, "debar: cannot create popup layer surface\n");
     wl_surface_destroy(state->popup_surface);
     state->popup_surface = NULL;
     return;
   }
 
-  zwlr_layer_surface_v1_set_size(state->popup_layer, CAL_WIDTH, CAL_HEIGHT);
+  state->popup_kind = kind;
+  state->popup_w = popup_w;
+  state->popup_h = popup_h;
+  memset(&state->netui, 0, sizeof(state->netui));
+  memset(&state->levelui, 0, sizeof(state->levelui));
+  g_level_pending = -1;
+  g_popup_opened_ms = mono_ms();
+  g_popup_pointer_seen = false;
+  g_drag_end_ms = 0;
+  if (kind == POPUP_WIFI) {
+    netmgr_wifi_refresh();
+  } else if (kind == POPUP_BLUETOOTH) {
+    netmgr_bt_refresh();
+  } else if (kind == POPUP_CPU) {
+    /* the percentages need two samples: take the baseline now and the first
+     * real sample shortly after, instead of showing zeros for a whole tick */
+    sysinfo_open(SYSINFO_CPU);
+    g_refresh_at_ms = mono_ms() + SYSINFO_FIRST_SAMPLE_MS;
+  } else if (kind == POPUP_MEM) {
+    sysinfo_open(SYSINFO_MEM);
+  }
+
+  zwlr_layer_surface_v1_set_size(state->popup_layer, popup_w, popup_h);
   zwlr_layer_surface_v1_set_anchor(
       state->popup_layer,
       (at_bottom ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
@@ -210,15 +481,381 @@ static void popup_open(wayland_state_t *state) {
   wl_display_flush(state->display);
 }
 
-static void popup_toggle(wayland_state_t *state) {
-  if (state->popup_surface != NULL) {
-    popup_close(state);
+/* Clicking the icon of the popup that is already open closes it; clicking
+ * another one switches. */
+static void popup_toggle(wayland_state_t *state, popup_kind_t kind,
+                         double anchor_x) {
+  const bool same =
+      state->popup_surface != NULL && state->popup_kind == kind;
+  popup_close(state);
+  if (!same) {
+    popup_open(state, kind, anchor_x);
+  }
+}
+
+/* ---- Wi-Fi / Bluetooth popup input ------------------------------------- */
+
+static int net_row_count(const wayland_state_t *state) {
+  if (state->popup_kind == POPUP_WIFI) {
+    return netmgr_wifi()->count;
+  }
+  if (state->popup_kind == POPUP_BLUETOOTH) {
+    return netmgr_bt()->count;
+  }
+  return 0;
+}
+
+static void net_clamp_scroll(wayland_state_t *state) {
+  int max = net_row_count(state) - NETPOPUP_ROWS;
+  if (max < 0) {
+    max = 0;
+  }
+  if (state->netui.scroll > max) {
+    state->netui.scroll = max;
+  }
+  if (state->netui.scroll < 0) {
+    state->netui.scroll = 0;
+  }
+}
+
+/* A job finished or an action changed the state: follow it on the bar icons
+ * and in the open popup (including the Wi-Fi password prompt). */
+static void net_state_changed(wayland_state_t *state) {
+  if (sync_net_icons()) {
+    wayland_redraw(state);
+  }
+  if (state->popup_surface == NULL || !popup_is_net(state->popup_kind)) {
+    return;
+  }
+
+  if (state->popup_kind == POPUP_WIFI) {
+    const netmgr_wifi_t *wifi = netmgr_wifi();
+    if (wifi->need_password && !state->netui.password_mode) {
+      password_enter(state, wifi->password_ssid);
+    } else if (!wifi->need_password && state->netui.password_mode) {
+      password_leave(state, false);
+    }
+  }
+  net_clamp_scroll(state);
+  popup_redraw(state);
+}
+
+static void net_handle_key(wayland_state_t *state, uint32_t key) {
+  netpopup_ui_t *ui = &state->netui;
+
+  if (key == EVDEV_KEY_ESC) {
+    if (ui->password_mode) {
+      password_leave(state, true); /* back to the list */
+      popup_redraw(state);
+    } else {
+      popup_close(state);
+    }
+    return;
+  }
+  if (!ui->password_mode) {
+    return;
+  }
+
+  if (key == EVDEV_KEY_ENTER || key == EVDEV_KEY_KPENTER) {
+    if (state->password[0] != '\0') {
+      netmgr_wifi_connect(ui->password_ssid, state->password);
+      wipe(state->password, sizeof(state->password));
+      ui->password_len = 0;
+      net_state_changed(state);
+    }
+    return;
+  }
+
+  if (key == EVDEV_KEY_BACKSPACE) {
+    size_t len = strlen(state->password);
+    if (len > 0) {
+      do { /* drop one UTF-8 character: the tail bytes, then its lead byte */
+        len--;
+      } while (len > 0 && ((unsigned char)state->password[len] & 0xC0) == 0x80);
+      state->password[len] = '\0';
+      ui->password_len--;
+      popup_redraw(state);
+    }
+    return;
+  }
+
+  if (state->xkb_state == NULL) {
+    return;
+  }
+  char text[16];
+  const int n = xkb_state_key_get_utf8(state->xkb_state, key + 8, text,
+                                       (size_t)sizeof(text));
+  if (n <= 0 || (unsigned char)text[0] < 0x20 || text[0] == 0x7f) {
+    return;
+  }
+  const size_t len = strlen(state->password);
+  if (len + (size_t)n < sizeof(state->password)) {
+    memcpy(state->password + len, text, (size_t)n);
+    state->password[len + (size_t)n] = '\0';
+    ui->password_len++;
+    popup_redraw(state);
+  }
+}
+
+static void net_click(wayland_state_t *state) {
+  netpopup_ui_t *ui = &state->netui;
+  int row = -1;
+  const netpopup_hit_kind_t hit = render_netpopup_hit(
+      state->pointer_x, state->pointer_y, ui->password_mode, &row);
+
+  if (hit == NETPOPUP_HIT_TOGGLE) {
+    if (state->popup_kind == POPUP_WIFI && netmgr_wifi()->available) {
+      netmgr_wifi_set_enabled(!netmgr_wifi()->enabled);
+    } else if (state->popup_kind == POPUP_BLUETOOTH && netmgr_bt()->available) {
+      netmgr_bt_set_powered(!netmgr_bt()->powered);
+    }
+  } else if (hit == NETPOPUP_HIT_ROW && !ui->password_mode) {
+    const int index = ui->scroll + row;
+    if (state->popup_kind == POPUP_WIFI) {
+      const netmgr_wifi_t *wifi = netmgr_wifi();
+      if (index >= 0 && index < wifi->count) {
+        if (wifi->nets[index].active) {
+          netmgr_wifi_disconnect();
+        } else {
+          netmgr_wifi_connect(wifi->nets[index].ssid, NULL);
+        }
+      }
+    } else if (state->popup_kind == POPUP_BLUETOOTH) {
+      netmgr_bt_toggle_device(index);
+    }
+  }
+
+  (void)netmgr_take_dirty();
+  net_state_changed(state);
+}
+
+/* Mouse wheel scrolls the list (accumulated: touchpads send fractions). */
+static void net_scroll(wayland_state_t *state, double value) {
+  static double acc = 0.0;
+  acc += value;
+  int rows = 0;
+  while (acc >= WHEEL_UNITS_PER_NOTCH) {
+    rows++;
+    acc -= WHEEL_UNITS_PER_NOTCH;
+  }
+  while (acc <= -WHEEL_UNITS_PER_NOTCH) {
+    rows--;
+    acc += WHEEL_UNITS_PER_NOTCH;
+  }
+  if (rows == 0) {
+    return;
+  }
+  const int before = state->netui.scroll;
+  state->netui.scroll += rows;
+  net_clamp_scroll(state);
+  if (state->netui.scroll != before) {
+    popup_redraw(state);
+  }
+}
+
+static void net_hover(wayland_state_t *state) {
+  netpopup_ui_t *ui = &state->netui;
+  int row = -1;
+  const netpopup_hit_kind_t hit = render_netpopup_hit(
+      state->pointer_x, state->pointer_y, ui->password_mode, &row);
+  const int slot = hit == NETPOPUP_HIT_ROW ? row : -1;
+  if (hit != ui->hover_kind || slot != (ui->hover_kind == NETPOPUP_HIT_ROW ? ui->hover_row : -1)) {
+    ui->hover_kind = hit;
+    ui->hover_row = slot;
+    popup_redraw(state);
+  }
+}
+
+/* ---- Volume / brightness popup input ------------------------------------ */
+
+static int level_percent(const wayland_state_t *state) {
+  return label_percent(state->popup_kind == POPUP_VOLUME
+                           ? wayland_data.volume
+                           : wayland_data.brightness);
+}
+
+/* Sends the new level to wpctl/pactl or brightnessctl (the label follows). */
+static void level_send(wayland_state_t *state, int percent) {
+  if (state->popup_kind == POPUP_VOLUME) {
+    modules_volume_set(&wayland_data, percent);
   } else {
-    popup_open(state);
+    modules_brightness_set(&wayland_data, percent);
+  }
+  g_level_sent_ms = mono_ms();
+  g_level_pending = -1;
+}
+
+/* Moves the shown label without running a command (throttled drag steps). */
+static void level_set_label(const wayland_state_t *state, int percent) {
+  if (state->popup_kind == POPUP_VOLUME) {
+    snprintf(wayland_data.volume, sizeof(wayland_data.volume), "%d%%", percent);
+  } else {
+    snprintf(wayland_data.brightness, sizeof(wayland_data.brightness), "%d%%",
+             percent < 1 ? 1 : percent);
+  }
+}
+
+/* Moves the level to percent. Clicks and key presses pass throttle = false;
+ * a drag passes true and keeps the command rate down. The bar and the popup
+ * are only repainted when the value really changed. */
+static void level_set(wayland_state_t *state, int percent, bool throttle) {
+  const int current = level_percent(state);
+  if (current < 0) {
+    return; /* no audio server / no backlight */
+  }
+  if (percent > 100) {
+    percent = 100;
+  }
+  if (percent < (state->popup_kind == POPUP_BRIGHTNESS ? 1 : 0)) {
+    percent = state->popup_kind == POPUP_BRIGHTNESS ? 1 : 0;
+  }
+  if (percent == current) {
+    return;
+  }
+
+  if (throttle && mono_ms() - g_level_sent_ms < LEVEL_DRAG_SEND_MS) {
+    level_set_label(state, percent);
+    g_level_pending = percent;
+  } else {
+    level_send(state, percent);
+  }
+  wayland_redraw(state);
+  popup_redraw(state);
+}
+
+static void level_nudge(wayland_state_t *state, int delta) {
+  const int current = level_percent(state);
+  if (current < 0) {
+    return;
+  }
+  level_set(state, current + delta, false);
+  g_refresh_at_ms = mono_ms() + LEVEL_RECONCILE_MS;
+}
+
+static void level_toggle_mute(wayland_state_t *state) {
+  modules_volume_toggle_mute(&wayland_data);
+  wayland_redraw(state);
+  popup_redraw(state);
+  g_refresh_at_ms = mono_ms() + LEVEL_RECONCILE_MS;
+}
+
+static void level_end_drag(wayland_state_t *state) {
+  if (!state->levelui.dragging) {
+    return;
+  }
+  state->levelui.dragging = false;
+  g_drag_end_ms = mono_ms();
+  if (g_level_pending >= 0 && popup_is_level(state->popup_kind)) {
+    level_send(state, g_level_pending);
+  }
+  g_level_pending = -1;
+  modules_hold_levels(false);
+  g_refresh_at_ms = mono_ms() + LEVEL_RECONCILE_MS;
+  popup_redraw(state);
+}
+
+static void level_click(wayland_state_t *state) {
+  const bool is_volume = state->popup_kind == POPUP_VOLUME;
+  int value = 0;
+  const levelpopup_hit_kind_t hit = render_levelpopup_hit(
+      is_volume, state->pointer_x, state->pointer_y, &value, NULL);
+
+  if (hit == LEVELPOPUP_HIT_SLIDER) {
+    /* grab the slider: until the button is released the pointer position
+     * drives the value, and the once-per-second re-read stays out of it */
+    state->levelui.dragging = true;
+    modules_hold_levels(true);
+    level_set(state, value, false);
+    popup_redraw(state);
+  } else if (hit == LEVELPOPUP_HIT_PRESET) {
+    level_set(state, value, false);
+    g_refresh_at_ms = mono_ms() + LEVEL_RECONCILE_MS;
+  } else if (hit == LEVELPOPUP_HIT_MUTE && is_volume) {
+    level_toggle_mute(state);
+  }
+}
+
+static void level_motion(wayland_state_t *state) {
+  levelpopup_ui_t *ui = &state->levelui;
+  if (ui->dragging) {
+    /* the pointer may leave the slider's box while the button is held */
+    level_set(state, render_levelpopup_slider_value(state->pointer_x), true);
+    return;
+  }
+
+  int index = -1;
+  const levelpopup_hit_kind_t hit =
+      render_levelpopup_hit(state->popup_kind == POPUP_VOLUME, state->pointer_x,
+                            state->pointer_y, NULL, &index);
+  const int preset = hit == LEVELPOPUP_HIT_PRESET ? index : -1;
+  if (hit != ui->hover_kind ||
+      (hit == LEVELPOPUP_HIT_PRESET && preset != ui->hover_preset)) {
+    ui->hover_kind = hit;
+    ui->hover_preset = preset;
+    popup_redraw(state);
+  }
+}
+
+/* Mouse wheel over the popup: whole notches move the level by 5 %. */
+static void level_scroll(wayland_state_t *state, double value) {
+  static double acc = 0.0;
+  acc += value;
+  int notches = 0;
+  while (acc >= WHEEL_UNITS_PER_NOTCH) {
+    notches++;
+    acc -= WHEEL_UNITS_PER_NOTCH;
+  }
+  while (acc <= -WHEEL_UNITS_PER_NOTCH) {
+    notches--;
+    acc += WHEEL_UNITS_PER_NOTCH;
+  }
+  if (notches == 0) {
+    return;
+  }
+  /* wheel down (positive axis) lowers the value, like on the bar pill */
+  level_nudge(state, -notches * LEVELPOPUP_STEP);
+}
+
+static void level_handle_key(wayland_state_t *state, uint32_t key) {
+  switch (key) {
+  case EVDEV_KEY_ESC:
+  case EVDEV_KEY_Q:
+    popup_close(state);
+    break;
+  case EVDEV_KEY_LEFT:
+  case EVDEV_KEY_DOWN:
+    level_nudge(state, -LEVELPOPUP_STEP);
+    break;
+  case EVDEV_KEY_RIGHT:
+  case EVDEV_KEY_UP:
+    level_nudge(state, LEVELPOPUP_STEP);
+    break;
+  case EVDEV_KEY_M:
+    if (state->popup_kind == POPUP_VOLUME) {
+      level_toggle_mute(state);
+    }
+    break;
+  default:
+    break;
   }
 }
 
 static void popup_handle_key(wayland_state_t *state, uint32_t key) {
+  if (popup_is_level(state->popup_kind)) {
+    level_handle_key(state, key);
+    return;
+  }
+  if (popup_is_net(state->popup_kind)) {
+    net_handle_key(state, key);
+    return;
+  }
+  if (popup_is_sys(state->popup_kind)) {
+    if (key == EVDEV_KEY_ESC || key == EVDEV_KEY_Q) {
+      popup_close(state);
+    }
+    return;
+  }
+
   switch (key) {
   case EVDEV_KEY_ESC:
   case EVDEV_KEY_Q:
@@ -251,6 +888,18 @@ static void popup_handle_key(wayland_state_t *state, uint32_t key) {
 
 /* Mouse wheel over the popup flips months. */
 static void popup_handle_axis(wayland_state_t *state, double value) {
+  if (popup_is_sys(state->popup_kind)) {
+    return; /* nothing to scroll */
+  }
+  if (popup_is_level(state->popup_kind)) {
+    level_scroll(state, value);
+    return;
+  }
+  if (popup_is_net(state->popup_kind)) {
+    net_scroll(state, value);
+    return;
+  }
+
   static struct timespec last = {0, 0};
 
   struct timespec now;
@@ -269,9 +918,15 @@ static void popup_handle_axis(wayland_state_t *state, double value) {
 /* ---------------- pointer input ------------------------------------------ */
 
 static void pointer_handle_button(wayland_state_t *state, uint32_t button) {
-  /* A click inside the popup only gives it keyboard focus. */
+  /* A click inside a popup: the calendar only takes keyboard focus, the
+   * Wi-Fi / Bluetooth managers act on what was clicked. */
   if (state->popup_surface != NULL &&
       state->pointer_surface == state->popup_surface) {
+    if (popup_is_net(state->popup_kind) && button == EVDEV_BTN_LEFT) {
+      net_click(state);
+    } else if (popup_is_level(state->popup_kind) && button == EVDEV_BTN_LEFT) {
+      level_click(state);
+    }
     return;
   }
 
@@ -281,11 +936,63 @@ static void pointer_handle_button(wayland_state_t *state, uint32_t button) {
   if (button == EVDEV_BTN_LEFT &&
       render_clock_span(state->config, &wayland_data, &clock_x, &clock_w) &&
       state->pointer_x >= clock_x && state->pointer_x <= clock_x + clock_w) {
-    popup_toggle(state);
+    popup_toggle(state, POPUP_CALENDAR, 0.0);
     return;
   }
 
-  /* Any other click on the bar dismisses an open calendar. */
+  /* Left click on the Wi-Fi / Bluetooth icon toggles its manager. */
+  double icon_x = 0.0;
+  const render_status_icon_t icon =
+      button == EVDEV_BTN_LEFT
+          ? render_status_icon_hit(state->config, &wayland_data, state->tray,
+                                   (double)state->width, state->pointer_x,
+                                   state->pointer_y, &icon_x)
+          : RENDER_ICON_NONE;
+  if (icon != RENDER_ICON_NONE) {
+    popup_toggle(state,
+                 icon == RENDER_ICON_WIFI ? POPUP_WIFI : POPUP_BLUETOOTH,
+                 icon_x);
+    return;
+  }
+
+  /* Left click on the CPU or RAM pill toggles its detail popup. */
+  double pill_x = 0.0;
+  const render_sys_pill_t pill =
+      button == EVDEV_BTN_LEFT
+          ? render_sys_pill_hit(state->config, &wayland_data, state->tray,
+                                (double)state->width, state->pointer_x,
+                                state->pointer_y, &pill_x)
+          : RENDER_SYS_NONE;
+  if (pill != RENDER_SYS_NONE) {
+    popup_toggle(state, pill == RENDER_SYS_CPU ? POPUP_CPU : POPUP_MEM,
+                 pill_x);
+    return;
+  }
+
+  /* Left click on the volume or brightness half of the pill toggles its
+   * popup. (The wheel over the pill still changes the value directly.) */
+  double level_x = 0.0;
+  const render_scroll_target_t level =
+      button == EVDEV_BTN_LEFT
+          ? render_level_pill_hit(state->config, &wayland_data, state->tray,
+                                  (double)state->width, state->pointer_x,
+                                  state->pointer_y, &level_x)
+          : RENDER_SCROLL_NONE;
+  if (level != RENDER_SCROLL_NONE) {
+    popup_toggle(state,
+                 level == RENDER_SCROLL_VOLUME ? POPUP_VOLUME
+                                               : POPUP_BRIGHTNESS,
+                 level_x);
+    return;
+  }
+
+  /* Any other click on the bar dismisses an open popup. */
+  if (state->popup_surface != NULL) {
+    dlog("debar debug: popup closed: click at (%.1f, %.1f) on the bar "
+         "(pointer surface is %s)",
+         state->pointer_x, state->pointer_y,
+         state->pointer_surface == state->surface ? "the bar" : "unknown");
+  }
   popup_close(state);
 
   /* Tray icons: left activates the item, middle asks for its secondary
@@ -321,21 +1028,13 @@ static void pointer_handle_button(wayland_state_t *state, uint32_t button) {
 /* Wheel input is accumulated: a mouse wheel sends ~10 axis units per notch,
  * touchpads send a stream of fractions. Whole notches become 5% steps, so
  * fast scrolling applies proportionally instead of dropping events. */
-#define WHEEL_UNITS_PER_NOTCH 10.0
 #define WHEEL_STEP_PERCENT 5
 #define WHEEL_MAX_NOTCHES 5
 
 /* The label moves instantly; give the external tool a moment, then reconcile
  * with the authoritative value from the next poll. */
 #define ACTION_REFRESH_DELAY_MS 120
-static long g_refresh_at_ms = 0;
 static double g_wheel_acc = 0.0;
-
-static long mono_ms(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
 
 static void pointer_handle_axis(wayland_state_t *state, double value) {
   /* The wheel never switches workspaces - that belongs to the compositor's
@@ -377,6 +1076,9 @@ static void pointer_handle_axis(wayland_state_t *state, double value) {
 
   /* the step functions already moved the label: show it right away */
   wayland_redraw(state);
+  if (state->popup_surface != NULL && popup_is_level(state->popup_kind)) {
+    popup_redraw(state);
+  }
   g_refresh_at_ms = mono_ms() + ACTION_REFRESH_DELAY_MS;
   dlog("debar debug: wheel over %s, %+d%%",
        target == RENDER_SCROLL_VOLUME ? "volume" : "brightness", delta);
@@ -392,10 +1094,14 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
   (void)pointer;
   wayland_state_t *state = data;
   state->pointer_surface = surface;
+  if (surface != NULL && surface == state->popup_surface) {
+    g_popup_pointer_seen = true;
+  }
   state->pointer_x = wl_fixed_to_double(surface_x);
   state->pointer_y = wl_fixed_to_double(surface_y);
-  dlog("debar debug: pointer enter (%.1f, %.1f)", state->pointer_x,
-       state->pointer_y);
+  dlog("debar debug: pointer enter %s (%.1f, %.1f)",
+       surface == state->popup_surface && surface != NULL ? "popup" : "bar",
+       state->pointer_x, state->pointer_y);
 }
 
 static void pointer_leave(void *data, struct wl_pointer *pointer,
@@ -403,8 +1109,22 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
   (void)serial;
   (void)pointer;
   wayland_state_t *state = data;
+  dlog("debar debug: pointer leave %s",
+       surface == state->popup_surface && surface != NULL ? "popup" : "bar");
   if (state->pointer_surface == surface) {
     state->pointer_surface = NULL;
+  }
+  if (surface != NULL && surface == state->popup_surface &&
+      popup_is_net(state->popup_kind) &&
+      state->netui.hover_kind != NETPOPUP_HIT_NONE) {
+    state->netui.hover_kind = NETPOPUP_HIT_NONE; /* clear the hover highlight */
+    popup_redraw(state);
+  }
+  if (surface != NULL && surface == state->popup_surface &&
+      popup_is_level(state->popup_kind) && !state->levelui.dragging &&
+      state->levelui.hover_kind != LEVELPOPUP_HIT_NONE) {
+    state->levelui.hover_kind = LEVELPOPUP_HIT_NONE;
+    popup_redraw(state);
   }
 }
 
@@ -416,6 +1136,18 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
   wayland_state_t *state = data;
   state->pointer_x = wl_fixed_to_double(surface_x);
   state->pointer_y = wl_fixed_to_double(surface_y);
+  if (state->popup_surface != NULL &&
+      state->pointer_surface == state->popup_surface &&
+      popup_is_net(state->popup_kind)) {
+    net_hover(state);
+  }
+  /* A slider drag keeps receiving motion (implicit grab) even when the
+   * pointer leaves the popup, so it must not depend on the pointer surface. */
+  if (state->popup_surface != NULL && popup_is_level(state->popup_kind) &&
+      (state->levelui.dragging ||
+       state->pointer_surface == state->popup_surface)) {
+    level_motion(state);
+  }
 }
 
 static void pointer_button(void *data, struct wl_pointer *pointer,
@@ -428,6 +1160,8 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
    * itself only reacts to the left button */
   if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
     pointer_handle_button((wayland_state_t *)data, button);
+  } else if (button == EVDEV_BTN_LEFT) {
+    level_end_drag((wayland_state_t *)data); /* no-op unless a slider drag */
   }
 }
 
@@ -492,11 +1226,22 @@ static const struct wl_pointer_listener pointer_listener = {
 
 static void keyboard_keymap(void *data, struct wl_keyboard *keyboard,
                             uint32_t format, int32_t fd, uint32_t size) {
-  (void)data;
   (void)keyboard;
-  (void)format;
-  (void)size;
-  close(fd); /* raw evdev codes are enough, the keymap is not parsed */
+  wayland_state_t *state = data;
+  if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+    close(fd);
+    return;
+  }
+  /* Keep the fd (it costs nothing); the keymap is compiled on demand, while
+   * the Wi-Fi password prompt is open. */
+  if (state->keymap_fd >= 0) {
+    close(state->keymap_fd);
+  }
+  state->keymap_fd = fd;
+  state->keymap_size = size;
+  if (state->netui.password_mode) {
+    xkb_prepare(state);
+  }
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard,
@@ -507,6 +1252,8 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard,
   (void)keys;
   wayland_state_t *state = data;
   state->keyboard_surface = surface;
+  dlog("debar debug: keyboard focus -> %s",
+       surface == state->popup_surface && surface != NULL ? "popup" : "bar");
 }
 
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard,
@@ -514,11 +1261,32 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard,
   (void)keyboard;
   (void)serial;
   wayland_state_t *state = data;
+  dlog("debar debug: keyboard leave %s (pointer is over %s, dragging=%d)",
+       surface == state->popup_surface && surface != NULL ? "popup" : "bar",
+       state->pointer_surface == NULL ? "nothing"
+       : state->pointer_surface == state->popup_surface ? "the popup" : "the bar",
+       state->levelui.dragging ? 1 : 0);
   if (state->keyboard_surface == surface) {
     state->keyboard_surface = NULL;
   }
-  /* focus moved to another window: dismiss the calendar */
   if (state->popup_surface != NULL && surface == state->popup_surface) {
+    const long now = mono_ms();
+    const char *keep = NULL;
+    if (state->levelui.dragging) {
+      keep = "a slider is being dragged";
+    } else if (g_drag_end_ms != 0 && now - g_drag_end_ms < DRAG_END_GRACE_MS) {
+      keep = "a slider drag just ended";
+    } else if (!g_popup_pointer_seen &&
+               now - g_popup_opened_ms < POPUP_REACH_GRACE_MS) {
+      keep = "the pointer has not reached the popup yet";
+    }
+    if (keep != NULL) {
+      dlog("debar debug: keyboard focus left the popup, keeping it open: %s",
+           keep);
+      return;
+    }
+    /* focus moved to another window: dismiss the popup */
+    dlog("debar debug: popup closed: keyboard focus moved to another surface");
     popup_close(state);
   }
 }
@@ -541,13 +1309,17 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
                                uint32_t serial, uint32_t mods_depressed,
                                uint32_t mods_latched, uint32_t mods_locked,
                                uint32_t group) {
-  (void)data;
   (void)keyboard;
   (void)serial;
-  (void)mods_depressed;
-  (void)mods_latched;
-  (void)mods_locked;
-  (void)group;
+  wayland_state_t *state = data;
+  state->mods_depressed = mods_depressed;
+  state->mods_latched = mods_latched;
+  state->mods_locked = mods_locked;
+  state->mods_group = group;
+  if (state->xkb_state != NULL) {
+    xkb_state_update_mask(state->xkb_state, mods_depressed, mods_latched,
+                          mods_locked, 0, 0, group);
+  }
 }
 
 static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
@@ -669,6 +1441,7 @@ bool wayland_init(wayland_state_t *state, const bar_config_t *config) {
   memset(state, 0, sizeof(*state));
   state->config = config;
   state->running = true;
+  state->keymap_fd = -1;
   calendar_init(&state->calendar);
   state->display = wl_display_connect(NULL);
   if (state->display == NULL) {
@@ -746,29 +1519,31 @@ bool wayland_init(wayland_state_t *state, const bar_config_t *config) {
   return true;
 }
 
-/* Renders one frame from the current live data and queues the previous
- * buffer for reaping once the compositor releases it. */
+/* Inputs of the last frame that was actually drawn: a one-second tick whose
+ * data did not change does not need a new frame. */
+static modules_data_t g_last_drawn;
+static bool g_have_last_drawn = false;
+
+/* Renders one frame from the current live data. */
 void wayland_redraw(wayland_state_t *state) {
   if (state == NULL || !state->configured || state->width <= 0) {
     return;
   }
 
   bar_buffer_t *buffer =
-      render_buffer_create(state->shm, state->width, state->height);
+      acquire_buffer(state->shm, &state->buffers, state->width, state->height);
   if (buffer == NULL) {
     fprintf(stderr, "debar: failed to create Wayland buffer\n");
     return;
   }
 
+  (void)sync_net_icons();
   render_bar(buffer, state->config, &wayland_data, state->tray);
 
-  if (state->active_buffer != NULL) {
-    state->active_buffer->retired = true;
-  }
   buffer->busy = true;
-  buffer->next = state->buffers;
-  state->buffers = buffer;
   state->active_buffer = buffer;
+  memcpy(&g_last_drawn, &wayland_data, sizeof(g_last_drawn));
+  g_have_last_drawn = true;
 
   wl_surface_attach(state->surface, buffer->wl_buffer, 0, 0);
   wl_surface_damage(state->surface, 0, 0, state->width, state->height);
@@ -777,8 +1552,10 @@ void wayland_redraw(wayland_state_t *state) {
 }
 
 static void reap_retired_buffers(wayland_state_t *state) {
-  reap_list(&state->buffers);
-  reap_list(&state->popup_buffers);
+  reap_idle_buffers(&state->buffers, state->width, state->height,
+                    &state->active_buffer);
+  reap_idle_buffers(&state->popup_buffers, state->popup_w, state->popup_h,
+                    &state->popup_active);
 }
 
 int wayland_run(wayland_state_t *state) {
@@ -796,7 +1573,7 @@ int wayland_run(wayland_state_t *state) {
   const int tray_fd =
       state->tray != NULL ? tray_event_fd(state->tray) : -1;
 
-  struct pollfd fds[3];
+  struct pollfd fds[3 + JOBS_MAX]; /* display, ipc, tray + async jobs */
   int nfds = 0;
   const int display_index = nfds++;
   fds[display_index].fd = display_fd;
@@ -838,7 +1615,16 @@ int wayland_run(wayland_state_t *state) {
         timeout = 1000;
       }
     }
-    const int poll_ret = poll(fds, (nfds_t)nfds, timeout);
+
+    /* Async Wi-Fi / Bluetooth commands: their pipes join the poll set, and a
+     * command that overstays its deadline wakes the loop to be killed. */
+    const int job_count = jobs_fill(&fds[nfds], JOBS_MAX);
+    const int job_timeout = jobs_timeout_ms();
+    const bool job_wakes_first = job_timeout >= 0 && job_timeout < timeout;
+    if (job_wakes_first) {
+      timeout = job_timeout;
+    }
+    const int poll_ret = poll(fds, (nfds_t)(nfds + job_count), timeout);
 
     if (poll_ret < 0) {
       if (errno == EINTR) {
@@ -879,7 +1665,12 @@ int wayland_run(wayland_state_t *state) {
       }
     }
 
-    if (poll_ret == 0) {
+    jobs_handle(&fds[nfds], job_count);
+    if (netmgr_take_dirty()) {
+      net_state_changed(state);
+    }
+
+    if (poll_ret == 0 && !job_wakes_first) {
       /* One-second tick (or an early refresh requested by a wheel action):
        * refresh live data and repaint. Workspaces are always re-queried so
        * occupancy ("has a program") stays accurate even when the event
@@ -887,7 +1678,22 @@ int wayland_run(wayland_state_t *state) {
        * reverting a just-clicked active workspace. */
       modules_update(&wayland_data);
       ipc_query_workspaces(&wayland_data);
-      wayland_redraw(state);
+      netmgr_tick(state->popup_surface != NULL && state->popup_kind == POPUP_WIFI,
+                  state->popup_surface != NULL &&
+                      state->popup_kind == POPUP_BLUETOOTH);
+      (void)sync_net_icons();
+      if (state->popup_surface != NULL && popup_is_sys(state->popup_kind)) {
+        sysinfo_sample(); /* /proc is only walked while a CPU/RAM popup is up */
+        popup_redraw(state);
+      }
+      if (state->popup_surface != NULL && popup_is_level(state->popup_kind) &&
+          !state->levelui.dragging) {
+        popup_redraw(state); /* follows volume keys, other mixers, ... */
+      }
+      if (!g_have_last_drawn ||
+          memcmp(&g_last_drawn, &wayland_data, sizeof(wayland_data)) != 0) {
+        wayland_redraw(state);
+      }
       g_refresh_at_ms = 0;
       /* midnight rollover: move the "today" marker while the popup is open */
       if (calendar_refresh_today(&state->calendar) &&
@@ -911,6 +1717,12 @@ void wayland_finish(wayland_state_t *state) {
   state->tray = NULL;
   ipc_finish();
   popup_close(state);
+  xkb_release(state);
+  if (state->keymap_fd >= 0) {
+    close(state->keymap_fd);
+    state->keymap_fd = -1;
+  }
+  wipe(state->password, sizeof(state->password));
   if (state->keyboard != NULL) {
     wl_keyboard_destroy(state->keyboard);
     state->keyboard = NULL;

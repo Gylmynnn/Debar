@@ -46,11 +46,27 @@ struct sway_frame {
 
 /* ---------------- small helpers ------------------------------------------ */
 
+/* Bounded string copy. Unlike strncpy it always terminates the destination
+ * and does not trigger truncation warnings for paths that may be longer than
+ * sockaddr_un.sun_path. */
+static void copy_path(char *dst, size_t cap, const char *src) {
+  if (cap == 0) {
+    return;
+  }
+  const size_t len = strlen(src);
+  const size_t n = len < cap ? len : cap - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
 static int connect_unix(const char *path) {
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  if (strlen(path) >= sizeof(addr.sun_path)) {
+    return -1;
+  }
+  copy_path(addr.sun_path, sizeof(addr.sun_path), path);
 
   const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -190,8 +206,7 @@ static void hypr_record_socket(const char *path) {
   if (g_hypr_socket_n >= HYPR_MAX_SOCKETS) {
     return;
   }
-  snprintf(g_hypr_sockets[g_hypr_socket_n], sizeof(g_hypr_sockets[0]), "%s",
-           path);
+  copy_path(g_hypr_sockets[g_hypr_socket_n], sizeof(g_hypr_sockets[0]), path);
   g_hypr_socket_n++;
 }
 
@@ -546,7 +561,7 @@ static bool hypr_discover(struct ipc_diag *diag) {
     hypr_record_socket(path); /* candidate for dispatch, tried in order */
     if (access(path, F_OK) == 0 && hypr_probe_command(path)) {
       snprintf(diag->cmd_socket, sizeof(diag->cmd_socket), "%s", prefs[i]);
-      snprintf(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), "%s", path);
+      copy_path(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), path);
       break;
     }
   }
@@ -566,7 +581,7 @@ static bool hypr_discover(struct ipc_diag *diag) {
         if (hypr_probe_command(path)) {
           snprintf(diag->cmd_socket, sizeof(diag->cmd_socket), "%.48s",
                    entry->d_name);
-          snprintf(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), "%s", path);
+          copy_path(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), path);
         }
       }
       closedir(dir);
@@ -642,7 +657,7 @@ ipc_compositor_t ipc_init(void) {
 
   const char *sway = getenv("SWAYSOCK");
   if (g_comp == IPC_NONE && sway != NULL) {
-    snprintf(g_sway_sock, sizeof(g_sway_sock), "%s", sway);
+    copy_path(g_sway_sock, sizeof(g_sway_sock), sway);
     g_event_fd = connect_unix(g_sway_sock);
     if (g_event_fd >= 0) {
       sway_subscribe();
@@ -653,7 +668,7 @@ ipc_compositor_t ipc_init(void) {
     /* last resort: scan for a sway socket */
     char found[PATH_MAX];
     if (discover_sway_sock(found, sizeof(found))) {
-      snprintf(g_sway_sock, sizeof(g_sway_sock), "%s", found);
+      copy_path(g_sway_sock, sizeof(g_sway_sock), found);
       g_event_fd = connect_unix(g_sway_sock);
       if (g_event_fd >= 0) {
         sway_subscribe();
@@ -799,8 +814,8 @@ static void hypr_probe_syntax(void) {
         g_hypr_form = (int)p;
         /* future commands go to the socket that actually answers */
         if (strcmp(g_hypr_cmd_path, g_hypr_sockets[i]) != 0) {
-          snprintf(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), "%s",
-                   g_hypr_sockets[i]);
+          copy_path(g_hypr_cmd_path, sizeof(g_hypr_cmd_path),
+                    g_hypr_sockets[i]);
         }
         if (ipc_debug()) {
           fprintf(stderr, "debar: dispatch form %zd: %.40s\n", p, probes[p]);
@@ -852,7 +867,7 @@ bool ipc_switch_workspace(modules_data_t *d, int workspace) {
         if (rc == HYPR_TRY_OK) {
           /* use whatever socket actually answers for future commands */
           if (strcmp(g_hypr_cmd_path, path) != 0) {
-            snprintf(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), "%s", path);
+            copy_path(g_hypr_cmd_path, sizeof(g_hypr_cmd_path), path);
           }
           g_hypr_form = (int)f;
           sent = true;
